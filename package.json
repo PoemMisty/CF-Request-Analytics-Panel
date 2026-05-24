@@ -1,0 +1,13 @@
+{
+  "name": "cf-request-analytics-panel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler pages dev . --compatibility-date=2026-05-23",
+    "check": "node --check src/worker.js && node --check functions/[[path]].js && node --check _worker.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
