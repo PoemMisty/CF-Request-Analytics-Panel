@@ -347,7 +347,7 @@ async function loadWorkerProjectMetrics(accounts, projectName, hours) {
     timeline: mergeProjectTimeline(rows),
     fourHourBuckets: mergeProjectBuckets(rows),
     accounts: rows,
-    note: matched ? "已按当前选中账号和指定 Service 统计项目级 Workers metrics；Zone HTTP 明细仍用于 Top IP/Host 来源分析。" : "已按当前选中账号和指定 Service 查询项目级 Workers metrics，当前时间范围内没有匹配请求数据。",
+    note: matched ? "已匹配指定 Service 的项目级 Workers metrics。" : "指定 Service 当前时间范围内无匹配请求数据。",
   };
 }
 
@@ -578,7 +578,7 @@ async function queryZone(account, zone, start, end, hours, host, bucketRanges = 
   const orderField = useMinute ? "datetimeMinute_ASC" : "datetimeHour_ASC";
   const filter = { datetime_geq: start, datetime_lt: end, requestSource: "eyeball" };
   if (host) filter.clientRequestHTTPHost = host;
-  const query = `query ZoneRequestAnalytics($zoneTag: string, $filter: filter) { viewer { zones(filter: { zoneTag: $zoneTag }) { totals: httpRequestsAdaptiveGroups(limit: 1, filter: $filter) { count sum { edgeResponseBytes } } timeline: httpRequestsAdaptiveGroups(limit: 2000, filter: $filter, orderBy: [${orderField}]) { count sum { edgeResponseBytes } dimensions { ${timeField} } } topIPs: httpRequestsAdaptiveGroups(limit: 20, filter: $filter, orderBy: [count_DESC]) { count dimensions { clientIP clientCountryName } } topHosts: httpRequestsAdaptiveGroups(limit: 20, filter: $filter, orderBy: [count_DESC]) { count dimensions { clientRequestHTTPHost } } } } }`;
+  const query = `query ZoneRequestAnalytics($zoneTag: string, $filter: filter) { viewer { zones(filter: { zoneTag: $zoneTag }) { totals: httpRequestsAdaptiveGroups(limit: 1, filter: $filter) { count sum { edgeResponseBytes } } timeline: httpRequestsAdaptiveGroups(limit: 2000, filter: $filter, orderBy: [${orderField}]) { count sum { edgeResponseBytes } dimensions { ${timeField} } } topIPs: httpRequestsAdaptiveGroups(limit: 20, filter: $filter, orderBy: [count_DESC]) { count dimensions { clientIP clientCountryName } } topHosts: httpRequestsAdaptiveGroups(limit: 20, filter: $filter, orderBy: [count_DESC]) { count dimensions { clientRequestHTTPHost } } topCountries: httpRequestsAdaptiveGroups(limit: 200, filter: $filter, orderBy: [count_DESC]) { count dimensions { clientCountryName } } } } }`;
   const payload = await cfGraphql(account.token, query, { zoneTag: zone.zoneTag, filter });
   const zoneData = payload.data?.viewer?.zones?.[0] || {};
   const aiBuckets = bucketRanges.length ? await Promise.all(bucketRanges.map((range) => queryZoneBucket(account, zone.zoneTag, host, range.start, range.end))) : [];
@@ -590,6 +590,7 @@ async function queryZone(account, zone, start, end, hours, host, bucketRanges = 
     timeline: fillTimeline(zoneData.timeline || [], hours, timeField, start, end),
     topIPs: zoneData.topIPs || [],
     topHosts: zoneData.topHosts || [],
+    topCountries: zoneData.topCountries || [],
     aiBuckets,
     errors: payload.errors || null,
   };
@@ -626,6 +627,7 @@ function mergeAnalytics(items, hours) {
   const points = new Map();
   const topIPs = new Map();
   const topHosts = new Map();
+  const topCountries = new Map();
   let totalRequests = 0;
   let totalBytes = 0;
   for (const item of items) {
@@ -652,6 +654,12 @@ function mergeAnalytics(items, hours) {
       old.count += entry.count || 0;
       topHosts.set(hostname, old);
     }
+    for (const entry of totals.topCountries || []) {
+      const country = entry.dimensions?.clientCountryName || "未知";
+      const old = topCountries.get(country) || { count: 0, dimensions: { clientCountryName: country } };
+      old.count += entry.count || 0;
+      topCountries.set(country, old);
+    }
   }
   return {
     totalRequests,
@@ -659,6 +667,7 @@ function mergeAnalytics(items, hours) {
     timeline: [...points.values()].sort((a, b) => a.time.localeCompare(b.time)),
     topIPs: [...topIPs.values()].sort((a, b) => b.count - a.count).slice(0, 20),
     topHosts: [...topHosts.values()].sort((a, b) => b.count - a.count).slice(0, 20),
+    topCountries: [...topCountries.values()].sort((a, b) => b.count - a.count).slice(0, 80),
     rangeHours: hours,
   };
 }
@@ -683,7 +692,7 @@ function buildAbusePrompt(input) {
   const compact = JSON.stringify(input);
   const verboseRule = input.verbose
     ? "最高优先级要求：直接输出完整数据与分析结果，按固定 Markdown 模板输出。不要输出思考过程、不要解释规则、不要把模板说明写进正文。"
-    : "最高优先级要求：只输出分析结果，不要复述完整原始数据；但必须完整查看全部 6 段每 4 小时细分数据，并在依据中引用关键 4 小时段变化。可以用简洁摘要写明 6 段趋势，不要逐项复述所有 Top IP/Top Host 原始列表。";
+    : "最高优先级要求：只输出分析结果，不要复述完整原始数据；但必须完整查看 24 小时趋势、6 段每 4 小时细分、Top IP、Top Host、国家/地区和 Workers 指标，并在依据中引用关键变化。";
   const outputTemplate = input.verbose
     ? `当前分析账号：<账号>
 当前分析域名：<域名>
@@ -695,6 +704,7 @@ function buildAbusePrompt(input) {
 #### 24 小时趋势
 #### Top IP
 #### Top Host
+#### 国家 / 地区
 #### 账号与区域
 ### 结论
 ### 风险等级
@@ -713,113 +723,83 @@ function buildAbusePrompt(input) {
 
 唯一目标：判断当前域名对应的代理节点、订阅链接、节点地址或配置是否可能外泄并被他人连接使用。
 
-最高原则：一切以降低误报为最高优先级。没有明确强证据时，默认判断为正常请求、客户端自动行为或爬虫扫描噪声。不要因为单个异常点推断节点泄露。
+最高原则：降低误报是最高优先级。没有连续高位、多个高请求 IP、来源持续扩散、Workers 用量异常等强证据时，默认判断为正常自用、客户端自动行为、爬虫扫描或普通请求噪声。不要因为单个峰值、单个国家/地区、单个高占比 IP 推断节点外泄。
 
 ${verboseRule}
 
 分析范围：
-- 只分析输入数据中当前账号、当前区域、当前域名的过去 24 小时数据。
+- 只分析输入数据中当前账号、当前区域、当前域名、当前服务名的过去 24 小时数据。
 - 不要假设其他域名、其他账号、全站流量或历史基线。
 - 如果缺少历史基线，不要做确定性判断。
 
 数据口径：
-- httpRequests.totalRequests 是当前域名 HTTP 总请求，可能包含普通网页/API、静态资源、客户端探测、爬虫、扫描器，不等同于代理真实使用量。
-- httpRequests.fourHourBuckets 是过去 24 小时 6 段数据，每段 4 小时，必须参与判断。
-- 每个 4 小时段包含 count、bytes、topIPs、topHosts。
-- httpRequests.timeline 是逐小时趋势，用于判断峰值、回落、持续性。
-- 输入中的 timeline 与 fourHourBuckets 时间已转换为北京时间 GMT+8，分析和输出都按北京时间描述。
+- httpRequests.totalRequests 是当前域名 HTTP 总请求，可能包含网页/API、静态资源、客户端探测、爬虫、扫描器，不等同于代理真实使用量。
+- httpRequests.timeline 是逐小时趋势，用于判断峰值、回落和持续性。
+- httpRequests.fourHourBuckets 是 6 段每 4 小时数据，必须参与判断。
 - topIPs 用于判断来源集中还是扩散。
 - topHosts 只作为流量分布参考。
+- topCountries 是客户端国家/地区聚合，用于辅助判断来源是否扩散。
+- topCountries 只能作为辅助信号，不能单独作为节点外泄证据。
 - workerUsage.workers 才用于判断 Workers 请求额度，不要用 httpRequests.totalRequests 判断 Workers 免费额度。
-- 如果输入包含 projectMetrics，说明用户手动指定了可观测性中的 Service 名称；此时必须强制使用 projectMetrics.timeline、projectMetrics.fourHourBuckets 和 workerUsage 中的项目级 Workers metrics 判断该服务，避免其他服务污染。
-- 如果 projectMetrics.matched 为 false 或 workerUsage.projectMatched 为 false，说明当前选中账号、指定 Service 和当前时间范围内没有匹配请求数据；必须说明这个口径，不要改用账号级 Workers/Pages 汇总做风险判断。
+- 如果输入包含 projectMetrics，说明用户指定了可观测性 Service 名称；此时必须优先使用 projectMetrics 和 workerUsage 中的项目级 Workers metrics 判断该服务。
+- 如果 projectMetrics.matched 为 false 或 workerUsage.projectMatched 为 false，必须说明当前服务名在该时间范围内没有匹配项目级 Workers 请求，不要改用账号级 Workers/Pages 汇总做该服务风险判断。
+- 输入中的时间已转换为北京时间 GMT+8，输出也按北京时间描述。
 - Workers / Pages 必须保留英文。
 
-先分类，再判断。你必须先在内部把流量归入以下类型之一，然后再输出结论：
+判断顺序：
+1. 先看 6 段 4 小时分段是否连续高位，还是单一高峰后回落。
+2. 再看 Top IP 是否由单一/少数固定 IP 主导，还是多个高请求 IP 同时存在。
+3. 再看国家/地区是否只是辅助扩散信号。
+4. 最后结合 Workers 用量或项目级 Workers metrics 判断是否存在资源异常。
 
-类型 A：正常自用
-- 单一 IP 或少数固定 IP 长时间占主要流量。
-- 最大 IP 占比很高，但来源稳定。
-- 总请求量不高。
-- 只有 1 个或少数 4 小时段有波动。
-- 前后分段明显回落。
+默认正常的情况：
+- 总请求量低于 3000。
+- 多数 Top IP 单 IP 请求数低于 1000。
+- 只有一个 4 小时段突出，前后段低或为 0。
+- 最大 IP 占比很高且来源稳定。
+- 高峰段对应用户实际上网时段。
+- 最大 IP 是用户出口 IP 或接近用户当前出口。
+- 国家/地区有分布，但单 IP 请求不高且没有连续高位。
 - Workers 用量很低。
-- 符合个人设备、固定出口、家庭宽带、移动网络、常用反代入口。
-- 6 段中只有当前使用时段明显较高，其他时段没有请求或请求很少，且高峰段由单一 IP 或少数固定 IP 主导，应优先判断为用户正在使用该节点，属于正常自用。
 
-类型 B：客户端自动行为
-- Clash、sing-box、Shadowrocket、Surge 等客户端自动探测。
-- URLTest / 自动测速、保活请求、订阅刷新、配置更新、网络切换后重连。
-- 多节点配置导致短时间批量探测。
-- 24 小时内请求较为均匀，说明客户端可能持续在线。
-- 客户端自动探测应体现为 24 小时内多数分段都有请求，且平峰期请求比较均匀。
-- 部分 4 小时段出现高峰，但前后有回落。
-- 平峰段仍有少量请求，说明更像保活、探测或自动测速。
-- 高峰段请求量上升，但来源仍集中在少数固定 IP。
-- 平峰段请求数和流量都较低，不能单独视为泄露。
-- 请求数有周期性波动，但没有连续多段来源扩散。
-- Workers 用量低时，优先解释为客户端自动行为。
-- 类型 B 更适合全天持续低量、平峰段也有少量且较均匀请求、多个时段周期性出现探测/保活的情况；如果其他时段几乎无请求，只是某个时段单一 IP 高占比，不要归为客户端自动探测或探测过多。
-
-类型 C：爬虫 / 扫描器 / 普通请求噪声
-- 多个 IP 请求数都很低。
-- 单 IP 请求数低于 1000。
-- 国家/地区分散但请求量小。
-- Top IP 多但每个请求量有限。
-- HTTP 请求存在，但 Workers 用量很低。
-- 没有持续高位，没有明显代理使用特征。
-
-类型 D：需要观察
-- 总请求量比普通情况偏高，但还没有明显持续性。
-- 单个 IP 超过 1000，但主要仍集中在一个 IP。
-- 4 小时分段中有峰值，但不是连续多段高位。
-- 来源略有扩散，但不足以判断节点泄露。
+需要观察的情况：
+- 总请求量偏高，但只有单个峰值或不足 2 个连续高位分段。
+- 单个 IP 超过 1000，但仍主要集中在一个 IP。
+- 来源略有扩散，但没有多个高请求 IP 同时存在。
 - 无法确认最大 IP 是否为用户本人出口。
+- 客户端探测/保活较频繁，但还不像外泄。
 
-类型 E：疑似节点外泄
-必须同时满足多项强证据：
+疑似节点外泄必须同时具备多项强证据：
 - 总请求量明显偏高。
 - 多个 Top IP 单 IP 请求数超过 1000。
 - 至少连续 2 个 4 小时段维持高位。
 - 来源从集中变为明显扩散。
-- 多国家、多 ASN、多入口同时高频。
-- 来源形态不像固定出口或常用反代入口。
+- 多国家/地区来源同时高频，并且不是低量噪声。
+- 来源形态不像固定出口、家庭宽带、移动网络或常用反代入口。
 - Workers 用量明显升高或持续增长。
 - 峰值没有回落，呈持续高位。
 
-类型 F：高风险节点外泄
-必须满足非常强的证据：
+高风险节点外泄必须满足更强证据：
 - 多个 4 小时段连续高位。
 - 多个高请求 IP 同时存在。
 - 来源明显扩散且持续。
 - 请求量和 Workers 用量都明显升高。
-- 不符合客户端探测、保活、订阅刷新、固定出口自用。
+- 不能解释为自用、客户端探测、保活、订阅刷新、爬虫扫描或 Cloudflare 调度。
 
-硬性阈值：
-- 总请求量低于 3000，默认正常。
-- 总请求量低于 3000，且多数 Top IP 单 IP 请求数低于 1000，必须判断为正常或无异常。
-- 单 IP 请求数低于 1000，默认按爬虫、扫描器、普通请求、客户端探测、测速或保活噪声处理。
-- 只有一个 4 小时段突出，前后段低或为 0，默认正常或客户端行为。
-- 只有一个 4 小时段突出，其他时段没有请求或非常少，不属于 24 小时自动探测，更像正在使用该节点。
-- 单一 IP 高占比不是风险，通常更像个人自用、固定出口或常用反代入口。
-- 如果 6 段中其他时段无请求或请求很少，只有 1 个使用时段明显升高，且最大 IP 占比很高，结论应写“当前请求正常。”或“当前请求无异常。”，风险等级写“低”。
-- 多国家/多地区分布不是风险，除非同时存在高请求量、持续高位和来源扩散。
-- Workers 使用率很低时，不要推断资源被滥用。
+国家 / 地区规则：
+- 国家分散不是风险，除非同时存在连续高位、多个高请求 IP 和来源持续扩散。
+- 国家/地区分散不是风险，除非多个来源都有高请求量并持续出现。
+- 如果国家/地区集中在少数项，优先解释为固定出口、常用网络或正常用户分布。
+- 如果引用国家/地区，只能写成辅助依据，不要写成唯一风险原因。
 
-最大 IP 规则：
-- 如果最大 Top IP 请求数超过 1000，必须在依据中写出最大 IP、请求数、占比。
-- 并在建议中提示：如果这是你的 IP，或接近你当前出口 IP，则当前属于正常请求。
-
-类型 B + Workers 额度高位规则：
-- 如果出现真正的类型 B 客户端自动行为，且 workerUsage.workerUsagePercent >= 80，或 workerUsage.workers 接近/超过免费额度 80%，不要判断为节点泄露，应判断为疑似探测次数过多。
-- 单一使用时段高、其他时段几乎无请求、最大 IP 高占比，不属于探测次数过多。
-- 此时结论写“需要观察。”，风险等级写“观察”。
-- 可能原因写“客户端探测/保活过于频繁”。
-- 建议从这些内容选择：减少节点数量、增加探测时间间隔、使用无探测配置。
+客户端自动行为规则：
+- Clash、sing-box、Shadowrocket、Surge 等客户端可能产生 URLTest、自动测速、保活请求、订阅刷新、网络切换后重连。
+- 这类行为通常表现为多个时段低量、周期性、平峰仍有少量请求。
+- 如果 Workers 用量接近免费额度 80%，但来源仍集中且像自动探测，应判断为“需要观察”，原因写“客户端探测/保活过于频繁”，不要直接判断外泄。
 
 低风险输出规则：
-- 当判断为正常或无异常时，不要猜测复杂原因，不要给过度建议，不要写节点泄露、疑似泄露、被他人使用。
-- 可能原因只允许从以下短语选择：客户端探测/保活、订阅刷新、临时测速、爬虫扫描噪声、普通请求噪声、固定出口自用。
+- 判断正常或无异常时，不要写节点泄露、疑似泄露、被他人使用。
+- 可能原因只允许从以下短语选择：客户端探测/保活、订阅刷新、临时测速、爬虫扫描噪声、普通请求噪声、固定出口自用、Cloudflare 调度。
 - 建议只允许从以下短语选择：无需处理，继续常规观察、维持现状、观察后续是否持续、如最大 IP 是你的出口，则属正常、如高峰对应你的上网时段，则属正常。
 
 风险等级：
@@ -841,9 +821,9 @@ ${outputTemplate}
 - 依据最多 3 条，每条不超过 28 个汉字；必须提到 6 段/4 小时分段趋势。
 - 可能原因最多 2 条，每条不超过 22 个汉字。
 - 建议最多 2 条，每条不超过 24 个汉字。
-- 如果最大 IP 占比较大，输出的“建议”中必须包含：如最大 IP 是你的出口，则属正常。
-- 如果存在明显高峰期且平峰期请求较低，输出的“建议”中必须包含：如高峰对应你的上网时段，则属正常。
-- 如果 verbose 为 true，按“完整数据”各小标题复述输入关键字段；如果 verbose 为 false，不输出完整数据，但仍必须完整查看全部 6 段每 4 小时数据。
+- 如果最大 IP 占比较大，建议中必须包含：如最大 IP 是你的出口，则属正常。
+- 如果存在明显高峰期且平峰期请求较低，建议中必须包含：如高峰对应你的上网时段，则属正常。
+- 如果 verbose 为 true，按“完整数据”各小标题复述输入关键字段；如果 verbose 为 false，不输出完整数据，但仍必须完整查看全部输入数据。
 
 数据：${compact}`;
 }
@@ -1239,9 +1219,14 @@ function redactForPublic(body, privacy) {
   }
   if (!privacy.publicTopIPs) {
     safe.summary.topIPs = [];
+    safe.summary.topCountries = [];
     for (const account of safe.accounts) {
       account.totals.topIPs = [];
-      for (const zone of account.zones || []) zone.topIPs = [];
+      account.totals.topCountries = [];
+      for (const zone of account.zones || []) {
+        zone.topIPs = [];
+        zone.topCountries = [];
+      }
     }
   }
   if (!privacy.publicTopHosts) {
@@ -1395,6 +1380,9 @@ const INDEX_HTML = `<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CF Request Analytics Panel</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/jsvectormap/dist/css/jsvectormap.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/jsvectormap"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jsvectormap/dist/maps/world-merc.js"></script>
   <style>
     :root { color-scheme: dark; --bg:#0a1020; --panel:#111a2f; --card:#16213a; --text:#eef5ff; --muted:#8ea3c3; --line:#2a3a5d; --accent:#5eead4; --warn:#f59e0b; --bad:#fb7185; }
     * { box-sizing: border-box; min-width:0; }
@@ -1427,12 +1415,33 @@ const INDEX_HTML = `<!doctype html>
     .chart-wrap canvas { width:100% !important; height:100% !important; display:block; }
     .chart-head { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
     .chart-head label { min-width:220px; }
+    .country-map { overflow:hidden; min-height:auto; border:1px solid rgba(255,255,255,.08); border-radius:18px; background:radial-gradient(circle at 50% 45%, rgba(94,234,212,.12), transparent 55%), rgba(255,255,255,.03); padding:8px; }
+    #worldMap { width:100%; height:clamp(280px, 36vw, 460px); min-height:280px; }
+    .jvm-container { background:transparent !important; }
+    .jvm-region { stroke:rgba(148,163,184,.42); stroke-width:.65; }
+    .jvm-tooltip { background:#0d172b; border:1px solid var(--line); color:var(--text); border-radius:10px; padding:7px 9px; box-shadow:0 18px 45px rgba(0,0,0,.35); }
+    .map-legend { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; color:var(--muted); font-size:12px; }
+    .map-legend span { display:inline-flex; align-items:center; gap:5px; }
+    .map-legend i { width:10px; height:10px; border-radius:999px; display:inline-block; }
+    .country-table { margin-top:12px; }
+    .country-table col:nth-child(1) { width:54%; }
+    .country-table col:nth-child(2) { width:26%; }
+    .country-table col:nth-child(3) { width:20%; }
+    .country-table th:nth-child(3), .country-table td:nth-child(3) { white-space:nowrap; }
     label { display:grid; gap:8px; }
     .card small, label, .muted { color:var(--muted); }
     .split { display:grid; grid-template-columns: 1.45fr .95fr; gap:16px; }
     table { width:100%; border-collapse:collapse; table-layout:fixed; }
     th, td { padding:11px 8px; border-bottom:1px solid rgba(255,255,255,.08); text-align:left; overflow-wrap:anywhere; word-break:break-word; }
     th { color:var(--muted); font-weight:600; }
+    .ip-table col:nth-child(1) { width:48%; }
+    .ip-table col:nth-child(2) { width:14%; }
+    .ip-table col:nth-child(3) { width:22%; }
+    .ip-table col:nth-child(4) { width:16%; }
+    .host-table col:nth-child(1) { width:58%; }
+    .host-table col:nth-child(2) { width:24%; }
+    .host-table col:nth-child(3) { width:18%; }
+    .ip-table th:nth-child(4), .ip-table td:nth-child(4), .host-table th:nth-child(3), .host-table td:nth-child(3) { white-space:nowrap; }
     .login { max-width:380px; margin:auto; margin-top:8vh; }
     .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
     header > .row { margin-left:auto; justify-content:flex-end; }
@@ -1448,6 +1457,7 @@ const INDEX_HTML = `<!doctype html>
     .bar { height:12px; border-radius:99px; background:rgba(255,255,255,.08); overflow:hidden; }
     .bar span { display:block; height:100%; width:0; border-radius:99px; background:linear-gradient(90deg,#22c55e,#eab308,#ef4444); transition:width .5s ease; }
     .usage-card strong { display:block; margin-top:10px; font-size:20px; }
+    .usage-card strong { white-space:nowrap; }
     .modal-mask { position:fixed; inset:0; background:rgba(3,7,18,.72); display:none; place-items:center; z-index:50; padding:18px; }
     .modal-mask.open { display:grid; }
     .modal-card { width:min(460px,100%); border:1px solid var(--line); background:#111a2f; border-radius:24px; padding:22px; box-shadow:0 30px 90px rgba(0,0,0,.45); }
@@ -1460,7 +1470,8 @@ const INDEX_HTML = `<!doctype html>
     .overlay-panel.open { display:grid; }
     @media (max-width: 900px) { .toolbar, .cards, .split { grid-template-columns:1fr; } header { align-items:flex-start; flex-direction:column; } header > .row { margin-left:0; justify-content:flex-start; } }
     @media (max-width: 900px) { .usage-bars { grid-template-columns:1fr; } }
-    @media (max-width: 520px) { h1{font-size:28px}.panel{padding:14px;border-radius:18px}.usage-card{padding:14px}.usage-card strong{font-size:20px}.row a,.row button,button{width:100%;justify-content:center;text-align:center}.toolbar button{justify-self:stretch}.cards{gap:10px} }
+    @media (max-width: 520px) { h1{font-size:28px}.panel{padding:14px;border-radius:18px}.usage-card{padding:14px}.usage-card strong{font-size:20px}.row a,.row button,button{width:100%;justify-content:center;text-align:center}.toolbar button{justify-self:stretch}.cards{gap:10px}#worldMap{height:clamp(240px,70vw,340px);min-height:240px}.map-legend{margin-top:4px} th,td{padding:10px 5px;font-size:13px}.ip-table col:nth-child(1){width:52%}.ip-table col:nth-child(2){width:11%}.ip-table col:nth-child(3){width:20%}.ip-table col:nth-child(4){width:17%}.host-table col:nth-child(1){width:60%}.host-table col:nth-child(2){width:22%}.host-table col:nth-child(3){width:18%} }
+    @media (max-width: 900px) and (orientation: landscape) { #worldMap{height:clamp(220px,48vh,320px);min-height:220px} }
   </style>
 </head>
 <body>
@@ -1504,9 +1515,14 @@ const INDEX_HTML = `<!doctype html>
       <div class="chart-wrap"><canvas id="trafficChart"></canvas></div>
       <div id="trafficChartBlocked" class="muted privacy-hidden">流量折线涉及访问时间分布，管理员未开放未登录展示。</div>
     </section>
+    <section class="panel" id="countryPanel">
+      <div class="chart-head"><h3>国家/地区请求地图</h3></div>
+      <div id="countryMap" class="country-map"></div>
+      <div id="countryBlocked" class="muted privacy-hidden">国家/地区分布涉及访问来源，管理员未开放未登录展示。</div>
+    </section>
     <section class="split">
-      <div class="panel"><h3>Top IPs</h3><div id="ipBlocked" class="muted privacy-hidden">详细 IP 涉及隐私，管理员未开放未登录展示。</div><table id="ipTableWrap"><thead><tr><th>IP</th><th>国家/地区</th><th>请求</th></tr></thead><tbody id="ipTable"></tbody></table></div>
-      <div class="panel"><h3>Top Hosts</h3><div id="hostBlocked" class="muted privacy-hidden">主机明细涉及隐私，管理员未开放未登录展示。</div><table id="hostTableWrap"><thead><tr><th>Host</th><th>请求</th></tr></thead><tbody id="hostTable"></tbody></table></div>
+      <div class="panel"><h3>Top IPs</h3><div id="ipBlocked" class="muted privacy-hidden">详细 IP 涉及隐私，管理员未开放未登录展示。</div><table id="ipTableWrap" class="ip-table"><colgroup><col><col><col><col></colgroup><thead><tr><th>IP</th><th>国家</th><th>请求</th><th>占比</th></tr></thead><tbody id="ipTable"></tbody></table></div>
+      <div class="panel"><h3>Top Hosts</h3><div id="hostBlocked" class="muted privacy-hidden">主机明细涉及隐私，管理员未开放未登录展示。</div><table id="hostTableWrap" class="host-table"><colgroup><col><col><col></colgroup><thead><tr><th>Host</th><th>请求</th><th>占比</th></tr></thead><tbody id="hostTable"></tbody></table></div>
     </section>
   </main>
   <footer>Powered by <a href="https://github.com/PoemMisty/CF-Request-Analytics-Panel" target="_blank" rel="noopener">CF Request Analytics Panel</a></footer>
@@ -1540,26 +1556,39 @@ const INDEX_HTML = `<!doctype html>
       if (!res.ok) { const err = new Error(data.message || data.error || "请求失败"); err.code = data.error || "request_failed"; throw err; }
       return data;
     }
-    function fmt(n) { return Intl.NumberFormat("zh-CN").format(n || 0); }
+    function fmt(n) { const value = Number(n || 0); const abs = Math.abs(value); if (abs < 1000) return Intl.NumberFormat("zh-CN").format(value); const units = [[1e12,"T"],[1e9,"B"],[1e6,"M"],[1e3,"K"]]; const [base, suffix] = units.find(([size]) => abs >= size); const scaled = value / base; const fixed = Math.abs(scaled) >= 100 ? 0 : Math.abs(scaled) >= 10 ? 1 : 2; return Number(scaled.toFixed(fixed)).toString() + suffix; }
     function bytes(n) { if (!n) return "0 B"; const units=["B","KB","MB","GB","TB"]; let i=0,v=n; while(v>=1024&&i<units.length-1){v/=1024;i++;} return v.toFixed(i?2:0)+" "+units[i]; }
     function chartBytes(n) { if (!n) return "0 B"; const units=["B","KB","MB","GB","TB"]; let i=0,v=Math.abs(Number(n)||0); while(v>=999.5&&i<units.length-1){v/=1024;i++;} const fixed = v >= 100 ? 0 : v >= 10 ? 1 : 2; return (n < 0 ? "-" : "") + v.toFixed(fixed).replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1") + " " + units[i]; }
     async function init() { session = await api("/api/session"); document.body.classList.toggle("admin", session.admin); $("loginEntry").classList.toggle("privacy-hidden", session.admin); applyPrivacy(session.privacy); if (session.admin) await loadAccounts(); await refresh(); }
-    function applyPrivacy(privacy) { const canFilter = session.admin || privacy.publicFilters; const canTimeline = session.admin || privacy.publicTimeline; const canTopIPs = session.admin || privacy.publicTopIPs; const canTopHosts = session.admin || privacy.publicTopHosts; $("aiPanel").classList.toggle("privacy-hidden", Boolean(privacy.hideAiPanel)); $("accountFilter").classList.toggle("privacy-hidden", !canFilter); $("zoneFilter").classList.toggle("privacy-hidden", !canFilter); $("hostFilter").classList.toggle("privacy-hidden", !canFilter); $("projectFilter").classList.toggle("privacy-hidden", !canFilter); $("chartBlocked").classList.toggle("privacy-hidden", canTimeline); $("trafficChartBlocked").classList.toggle("privacy-hidden", canTimeline); $("lineChart").classList.toggle("privacy-hidden", !canTimeline); $("trafficChart").classList.toggle("privacy-hidden", !canTimeline); $("ipBlocked").classList.toggle("privacy-hidden", canTopIPs); $("ipTableWrap").classList.toggle("privacy-hidden", !canTopIPs); $("hostBlocked").classList.toggle("privacy-hidden", canTopHosts); $("hostTableWrap").classList.toggle("privacy-hidden", !canTopHosts); }
+    function applyPrivacy(privacy) { const canFilter = session.admin || privacy.publicFilters; const canTimeline = session.admin || privacy.publicTimeline; const canTopIPs = session.admin || privacy.publicTopIPs; const canTopHosts = session.admin || privacy.publicTopHosts; $("aiPanel").classList.toggle("privacy-hidden", Boolean(privacy.hideAiPanel)); $("accountFilter").classList.toggle("privacy-hidden", !canFilter); $("zoneFilter").classList.toggle("privacy-hidden", !canFilter); $("hostFilter").classList.toggle("privacy-hidden", !canFilter); $("projectFilter").classList.toggle("privacy-hidden", !canFilter); $("chartBlocked").classList.toggle("privacy-hidden", canTimeline); $("trafficChartBlocked").classList.toggle("privacy-hidden", canTimeline); $("lineChart").classList.toggle("privacy-hidden", !canTimeline); $("trafficChart").classList.toggle("privacy-hidden", !canTimeline); $("ipBlocked").classList.toggle("privacy-hidden", canTopIPs); $("countryBlocked").classList.toggle("privacy-hidden", canTopIPs); $("ipTableWrap").classList.toggle("privacy-hidden", !canTopIPs); $("countryMap").classList.toggle("privacy-hidden", !canTopIPs); $("hostBlocked").classList.toggle("privacy-hidden", canTopHosts); $("hostTableWrap").classList.toggle("privacy-hidden", !canTopHosts); }
     function escapeHtml(value) { return String(value || "").replace(/[&<>"]/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[ch])); }
     function inlineMarkdown(value) { return escapeHtml(value).replace(new RegExp("\\\\*\\\\*([^*]+)\\\\*\\\\*", "g"), "<strong>$1</strong>"); }
     function renderMarkdown(text) { const lines = String(text || "").split(String.fromCharCode(10)); let html = ""; let list = ""; const closeList = () => { if (list) { html += "</" + list + ">"; list = ""; } }; const sectionTitle = /^(结论|风险等级|依据|可能原因|建议|完整数据)$/; for (const raw of lines) { const line = raw.trim(); if (!line) { closeList(); continue; } if (line.startsWith("#### ")) { closeList(); html += "<h4>" + inlineMarkdown(line.slice(5)) + "</h4>"; continue; } if (line.startsWith("### ")) { closeList(); html += "<h3>" + inlineMarkdown(line.slice(4)) + "</h3>"; continue; } if (sectionTitle.test(line)) { closeList(); html += "<h3>" + inlineMarkdown(line) + "</h3>"; continue; } const ordered = line.match(/^\d+[.、]\s*(.+)$/); if (ordered) { if (list !== "ol") { closeList(); html += "<ol>"; list = "ol"; } html += "<li>" + inlineMarkdown(ordered[1]) + "</li>"; continue; } if (line.startsWith("- ")) { if (list !== "ul") { closeList(); html += "<ul>"; list = "ul"; } html += "<li>" + inlineMarkdown(line.slice(2)) + "</li>"; continue; } closeList(); html += "<p>" + inlineMarkdown(line) + "</p>"; } closeList(); return html; }
     async function loadAccounts() { const data = await api("/api/accounts").catch(() => ({accounts:[]})); accountCache = data.accounts || []; $("accountSelect").innerHTML = '<option value="all">全部账号汇总</option>' + accountCache.map(a => '<option value="' + escapeHtml(a.id) + '">' + escapeHtml(a.name) + '</option>').join(""); loadZones(); }
     function loadZones() { const accountId = $("accountSelect").value; const accounts = accountId === "all" ? accountCache : accountCache.filter(a => a.id === accountId); const zones = accounts.flatMap(a => (a.zones || []).map(z => ({ id:z.id, name:(accountId === "all" ? a.name + " / " : "") + (z.name || "未命名区域") }))); $("zoneSelect").innerHTML = '<option value="all">全部区域汇总</option>' + zones.map(z => '<option value="' + escapeHtml(z.id) + '">' + escapeHtml(z.name) + '</option>').join(""); }
-    function emptyDashboardSummary() { return { totalRequests:0, totalBytes:0, timeline:[], topIPs:[], topHosts:[] }; }
+    function emptyDashboardSummary() { return { totalRequests:0, totalBytes:0, timeline:[], topIPs:[], topHosts:[], topCountries:[] }; }
     function selectedScopeText() { const account = $("accountSelect").options[$("accountSelect").selectedIndex]?.textContent || "全部账号汇总"; const zone = $("zoneSelect").options[$("zoneSelect").selectedIndex]?.textContent || "全部区域汇总"; return account + " / " + zone; }
     async function refresh() { const q = new URLSearchParams({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours: $("rangeSelect").value, host: $("hostInput").value.trim(), projectName: $("projectInput").value.trim() }); try { const data = await api("/api/analytics?" + q); render(data.summary, data.hours, data.usage, data.analyticsAvailable !== false, data.projectMetrics, data.workerMetrics); } catch (err) { if (err.code === "no_account") { render(emptyDashboardSummary(), $("rangeSelect").value, { workers:0, pages:0, total:0, limit:0 }, false, null, null); $("analysisBlocked").textContent = err.message; return; } throw err; } }
     function shortBeijingTime(value) { const text = String(value || "").replace("T", " "); const match = text.match(/^(?:[0-9]{4}-)?([0-9]{2}-[0-9]{2})[ ]+([0-9]{2}:[0-9]{2})/); return match ? match[1] + " " + match[2] : text.replace(/^[0-9]{4}-/, "").replace(/:[0-9]{2}(?:[ ]+GMT[+]8|Z)?$/, ""); }
-    function render(s, hours, usage, available = true, projectMetrics = null, workerMetrics = null) { currentSummary = s; currentProjectMetrics = projectMetrics; currentWorkerMetrics = workerMetrics; currentAvailable = available; const scope = selectedScopeText(); if (projectMetrics?.matched) $("requestChartSource").value = "worker"; $("requestScopeText").textContent = scope; $("trafficScopeText").textContent = scope; $("workersScopeText").textContent = scope; $("pagesScopeText").textContent = scope; $("totalRequests").textContent = fmt(projectMetrics?.totalRequests ?? s.totalRequests); $("totalBytes").textContent = bytes(s.totalBytes); $("rangeText").textContent = hours + "h"; renderUsage(usage, projectMetrics); $("analysisBlocked").classList.toggle("privacy-hidden", available); $("aiBtn").disabled = !available; $("chartPanel").classList.toggle("blocked", !available); $("trafficChartPanel").classList.toggle("blocked", !available); $("ipTableWrap").classList.toggle("blocked", !available); $("hostTableWrap").classList.toggle("blocked", !available); $("ipTable").innerHTML = s.topIPs.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientIP) + '</td><td>' + escapeHtml(x.dimensions.clientCountryName||"-") + '</td><td>' + fmt(x.count) + '</td></tr>').join(""); $("hostTable").innerHTML = s.topHosts.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientRequestHTTPHost) + '</td><td>' + fmt(x.count) + '</td></tr>').join(""); renderCharts(); }
+    function percentText(count, total) { if (!total) return "0.0%"; const pct = count / total * 100; return pct < 0.1 ? "＜0.1%" : pct.toFixed(pct >= 10 ? 0 : 1) + "%"; }
+    const countryCodeMap = {"中国":"CN","China":"CN","中国香港":"HK","Hong Kong":"HK","台湾":"TW","Taiwan":"TW","日本":"JP","Japan":"JP","韩国":"KR","South Korea":"KR","新加坡":"SG","Singapore":"SG","印度":"IN","India":"IN","俄罗斯":"RU","Russia":"RU","美国":"US","United States":"US","加拿大":"CA","Canada":"CA","巴西":"BR","Brazil":"BR","英国":"GB","United Kingdom":"GB","德国":"DE","Germany":"DE","法国":"FR","France":"FR","荷兰":"NL","Netherlands":"NL","意大利":"IT","Italy":"IT","西班牙":"ES","Spain":"ES","澳大利亚":"AU","Australia":"AU","印度尼西亚":"ID","Indonesia":"ID","泰国":"TH","Thailand":"TH","越南":"VN","Vietnam":"VN","菲律宾":"PH","Philippines":"PH","马来西亚":"MY","Malaysia":"MY","土耳其":"TR","Turkey":"TR","阿联酋":"AE","United Arab Emirates":"AE","南非":"ZA","South Africa":"ZA","日本":"JP","韩国":"KR","中国澳门":"MO","Macao":"MO","葡萄牙":"PT","Portugal":"PT","瑞士":"CH","Switzerland":"CH","瑞典":"SE","Sweden":"SE","挪威":"NO","Norway":"NO","芬兰":"FI","Finland":"FI","丹麦":"DK","Denmark":"DK","波兰":"PL","Poland":"PL","捷克":"CZ","Czech Republic":"CZ","奥地利":"AT","Austria":"AT","比利时":"BE","Belgium":"BE","爱尔兰":"IE","Ireland":"IE","墨西哥":"MX","Mexico":"MX","智利":"CL","Chile":"CL","阿根廷":"AR","Argentina":"AR","哥伦比亚":"CO","Colombia":"CO","秘鲁":"PE","Peru":"PE","沙特阿拉伯":"SA","Saudi Arabia":"SA","以色列":"IL","Israel":"IL","巴基斯坦":"PK","Pakistan":"PK","孟加拉国":"BD","Bangladesh":"BD","尼泊尔":"NP","Nepal":"NP","斯里兰卡":"LK","Sri Lanka":"LK"};
+    let worldMapInstance = null;
+    let worldMapReady = false;
+    let worldMapLabels = {};
+    let worldMapColoredCodes = [];
+    function countryColor(pct) { if (pct >= 50) return "rgba(94,234,212,1)"; if (pct >= 30) return "rgba(94,234,212,.82)"; if (pct >= 20) return "rgba(94,234,212,.66)"; if (pct >= 10) return "rgba(94,234,212,.5)"; if (pct >= 5) return "rgba(94,234,212,.34)"; if (pct >= 0.1) return "rgba(94,234,212,.22)"; return "rgba(94,234,212,.12)"; }
+    function applyCountryColors(values, total) { if (!worldMapInstance?.regions) return; for (const code of worldMapColoredCodes) { if (worldMapInstance.regions[code]) worldMapInstance.regions[code].element.setStyle("fill", "rgba(219,234,254,.16)"); } worldMapColoredCodes = []; for (const [code, count] of Object.entries(values)) { if (!worldMapInstance.regions[code]) continue; worldMapInstance.regions[code].element.setStyle("fill", countryColor(Number(count || 0) / Math.max(Number(total || 0), 1) * 100)); worldMapColoredCodes.push(code); } }
+    function countryCode(name) { const code = String(name || "").trim().toUpperCase(); if (/^[A-Z]{2}$/.test(code)) return code; return countryCodeMap[name] || ""; }
+    function countryListHtml(list, total) { return '<table class="country-table"><colgroup><col><col><col></colgroup><thead><tr><th>国家</th><th>请求</th><th>占比</th></tr></thead><tbody>' + list.slice(0, 12).map((item) => { const name = item.dimensions.clientCountryName || "未知"; const count = Number(item.count || 0); return '<tr><td>' + escapeHtml(name) + '</td><td>' + fmt(count) + '</td><td>' + percentText(count, total) + '</td></tr>'; }).join("") + '</tbody></table>'; }
+    function renderCountryMap(items, total) { try { const list = (items || []).filter((item) => item?.dimensions?.clientCountryName).sort((a, b) => Number(b.count || 0) - Number(a.count || 0)).slice(0, 40); if (!list.length || !total) { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">暂无国家/地区分布数据</div>'; return; } const values = {}; const labels = {}; for (const item of list) { const name = item.dimensions.clientCountryName || "未知"; const code = countryCode(name); if (!code) continue; const count = Number(item.count || 0); values[code] = count; labels[code] = name + '：' + fmt(count) + '（' + percentText(count, total) + '）'; } const details = countryListHtml(list, total); if (!Object.keys(values).length) { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">暂无可映射到世界地图的国家数据</div>' + details; return; } if (typeof jsVectorMap !== "function") { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">世界地图资源加载失败，请刷新重试。</div>' + details; return; } worldMapLabels = labels; if (!worldMapInstance) { $("countryMap").innerHTML = '<div id="worldMap"></div><div class="map-legend"><span><i style="background:rgba(94,234,212,.22)"></i>0.1%+</span><span><i style="background:rgba(94,234,212,.34)"></i>5%+</span><span><i style="background:rgba(94,234,212,.5)"></i>10%+</span><span><i style="background:rgba(94,234,212,.66)"></i>20%+</span><span><i style="background:rgba(94,234,212,.82)"></i>30%+</span><span><i style="background:rgba(94,234,212,1)"></i>50%+</span></div><div id="countryRank"></div>'; worldMapInstance = new jsVectorMap({ selector: "#worldMap", map: "world_merc", backgroundColor: "transparent", zoomButtons: false, zoomOnScroll: false, regionStyle: { initial: { fill: "rgba(219,234,254,.16)", stroke: "rgba(148,163,184,.42)", strokeWidth: 0.65 }, hover: { stroke: "#5eead4", strokeWidth: 1.2 }, selected: { stroke: "#5eead4", strokeWidth: 1.2 } }, onRegionTooltipShow: (event, tooltip, code) => { if (worldMapLabels[code]) tooltip.text(worldMapLabels[code]); } }); $("countryRank").innerHTML = details; worldMapReady = true; setTimeout(() => { if (worldMapInstance) { worldMapInstance.updateSize(); applyCountryColors(values, total); } }, 60); return; } if (worldMapReady && worldMapInstance) { worldMapInstance.updateSize(); applyCountryColors(values, total); if ($("countryRank")) $("countryRank").innerHTML = details; } } catch (error) { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">世界地图渲染失败，请刷新重试。</div>'; } }
+    function render(s, hours, usage, available = true, projectMetrics = null, workerMetrics = null) { currentSummary = s; currentProjectMetrics = projectMetrics; currentWorkerMetrics = workerMetrics; currentAvailable = available; const scope = selectedScopeText(); if (projectMetrics?.matched) $("requestChartSource").value = "worker"; $("requestScopeText").textContent = scope; $("trafficScopeText").textContent = scope; $("workersScopeText").textContent = scope; $("pagesScopeText").textContent = scope; $("totalRequests").textContent = fmt(projectMetrics?.totalRequests ?? s.totalRequests); $("totalBytes").textContent = bytes(s.totalBytes); $("rangeText").textContent = hours + "h"; renderUsage(usage, projectMetrics); $("analysisBlocked").classList.toggle("privacy-hidden", available); $("aiBtn").disabled = !available; $("chartPanel").classList.toggle("blocked", !available); $("trafficChartPanel").classList.toggle("blocked", !available); $("countryPanel").classList.toggle("blocked", !available); $("ipTableWrap").classList.toggle("blocked", !available); $("hostTableWrap").classList.toggle("blocked", !available); $("ipTable").innerHTML = s.topIPs.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientIP) + '</td><td>' + escapeHtml(x.dimensions.clientCountryName||"-") + '</td><td>' + fmt(x.count) + '</td><td>' + percentText(Number(x.count || 0), s.totalRequests) + '</td></tr>').join(""); $("hostTable").innerHTML = s.topHosts.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientRequestHTTPHost) + '</td><td>' + fmt(x.count) + '</td><td>' + percentText(Number(x.count || 0), s.totalRequests) + '</td></tr>').join(""); try { renderCharts(); } catch (error) { $("requestChartNote").textContent = "折线图渲染失败，请刷新重试。"; } renderCountryMap(s.topCountries, s.totalRequests); }
     function chartOptions(formatter = fmt) { return { responsive:true, maintainAspectRatio:false, plugins:{ legend:{ labels:{ color:"#dbeafe" } }, tooltip:{ callbacks:{ label:(ctx) => ctx.dataset.label + "：" + formatter(ctx.parsed.y) } } }, scales:{ x:{ ticks:{ color:"#8ea3c3", maxTicksLimit:8 }, grid:{ color:"rgba(255,255,255,.06)" } }, y:{ ticks:{ color:"#8ea3c3", callback:(value) => formatter(value) }, grid:{ color:"rgba(255,255,255,.06)" } } } }; }
-    function renderLine(target, series, valueKey, label, color, formatter = fmt) { const labels = series.map(x => shortBeijingTime(x.time)); const values = series.map(x => Number(x[valueKey] || 0)); return new Chart($(target), { type:"line", data:{ labels, datasets:[{ label, data:values, borderColor:color, backgroundColor:color === "#5eead4" ? "rgba(94,234,212,.16)" : "rgba(96,165,250,.14)", tension:.28, fill:true }] }, options:chartOptions(formatter) }); }
-    function renderCharts() { if (chart) chart.destroy(); if (trafficChart) trafficChart.destroy(); $("requestChartNote").textContent = ""; if (!currentAvailable) return; const requestSource = $("requestChartSource").value; if (requestSource === "worker") { const series = currentWorkerMetrics?.timeline || []; $("requestChartTitle").textContent = currentProjectMetrics ? "请求数折线：项目 Worker 请求" : "请求数折线：Worker 请求"; if (series.length) chart = renderLine("lineChart", series, "count", currentProjectMetrics ? "项目 Worker 请求数（北京时间）" : "Worker 请求数（北京时间）", "#5eead4", fmt); else $("requestChartNote").textContent = "当前账号缺少 Account ID 或暂无 Worker 请求数据。"; } else { $("requestChartTitle").textContent = "请求数折线：HTTP 请求"; if (currentSummary.timeline?.length) chart = renderLine("lineChart", currentSummary.timeline, "count", "HTTP 请求数（北京时间）", "#5eead4", fmt); } $("trafficChartTitle").textContent = "流量折线：HTTP 流量"; if (currentSummary.timeline?.length) trafficChart = renderLine("trafficChart", currentSummary.timeline, "bytes", "HTTP 流量（北京时间）", "#60a5fa", chartBytes); setTimeout(() => { if (chart) chart.resize(); if (trafficChart) trafficChart.resize(); }, 60); }
-    function renderUsage(u, projectMetrics = null) { const limit = u?.limit || 0; setUsage("workers", u?.workers || 0, limit, false); setUsage("pages", u?.pages || 0, limit, false); setUsage("totalUsage", u?.total || 0, limit, true); const lines = [u?.missingAccounts ? "· 免费额度：Workers 和 Pages 共享同一免费请求额度；另有 " + u.missingAccounts + " 个账号未配置 Account ID，无法计入额度进度。" : "· 免费额度：Workers 和 Pages 共享同一免费请求额度；页面时间均按北京时间 GMT+8 展示；额度统计按 Cloudflare 当日接口返回口径计算，每个已配置 Account ID 的账号共享 100000 请求。"]; if (projectMetrics) { lines.push(projectMetrics.matched ? "· 项目筛选：统计卡、趋势图和 AI 分析均按当前选中账号与指定 Service 统计；Pages 计为 0。" : "· 项目筛选：已按当前选中账号与指定 Service 统计；当前时间范围内项目级请求为 0。"); lines.push("· HTTP 明细：Top IP / Top Host 和边缘响应流量仍来自当前域名 HTTP 明细。"); } $("usageNote").textContent = lines.join(String.fromCharCode(10)); }
-    function setUsage(prefix, value, limit, showLimit) { const pct = limit ? Math.min(100, value / limit * 100) : 0; $(prefix + "Bar").style.width = pct.toFixed(1) + "%"; $(prefix + "Pct").textContent = limit ? pct.toFixed(1) + "%" : "未配置"; $(prefix === "totalUsage" ? "totalUsage" : prefix + "Usage").textContent = limit ? (showLimit ? fmt(value) + " / " + fmt(limit) : fmt(value) + " 次") : "未配置 Account ID"; }
+    function renderLine(target, series, valueKey, label, color, formatter = fmt, total = null) { const labels = series.map(x => shortBeijingTime(x.time)); const values = series.map(x => Number(x[valueKey] || 0)); return new Chart($(target), { type:"line", data:{ labels, datasets:[{ label, data:values, borderColor:color, backgroundColor:color === "#5eead4" ? "rgba(94,234,212,.16)" : "rgba(96,165,250,.14)", tension:.28, fill:true }] }, options:chartOptions(formatter) }); }
+    function seriesTotal(series, key) { return (series || []).reduce((sum, item) => sum + Number(item?.[key] || 0), 0); }
+    function renderCharts() { if (chart) chart.destroy(); if (trafficChart) trafficChart.destroy(); $("requestChartNote").textContent = ""; if (!currentAvailable) return; const requestSource = $("requestChartSource").value; if (requestSource === "worker") { const series = currentWorkerMetrics?.timeline || []; const total = currentProjectMetrics?.totalRequests ?? seriesTotal(series, "count"); const projectLabel = currentProjectMetrics ? (currentProjectMetrics.projectName || $("projectInput").value.trim() || "当前服务") + " 项目 请求" : "Worker 请求"; $("requestChartTitle").textContent = "请求数折线：" + projectLabel + "（" + fmt(total) + "）"; if (series.length) chart = renderLine("lineChart", series, "count", projectLabel + "数（北京时间）", "#5eead4", fmt, total); else $("requestChartNote").textContent = "当前账号缺少 Account ID 或暂无 Worker 请求数据。"; } else { const total = Number(currentSummary.totalRequests || seriesTotal(currentSummary.timeline, "count")); $("requestChartTitle").textContent = "请求数折线：HTTP 请求（" + fmt(total) + "）"; if (currentSummary.timeline?.length) chart = renderLine("lineChart", currentSummary.timeline, "count", "HTTP 请求数（北京时间）", "#5eead4", fmt, total); } const trafficTotal = Number(currentSummary.totalBytes || seriesTotal(currentSummary.timeline, "bytes")); $("trafficChartTitle").textContent = "流量折线：HTTP 流量（" + chartBytes(trafficTotal) + "）"; if (currentSummary.timeline?.length) trafficChart = renderLine("trafficChart", currentSummary.timeline, "bytes", "HTTP 流量（北京时间）", "#60a5fa", chartBytes, trafficTotal); setTimeout(() => { if (chart) chart.resize(); if (trafficChart) trafficChart.resize(); }, 60); }
+    function resizeVisuals() { if (chart) chart.resize(); if (trafficChart) trafficChart.resize(); if (worldMapInstance) worldMapInstance.updateSize(); }
+    function renderUsage(u, projectMetrics = null) { const limit = u?.limit || 0; setUsage("workers", u?.workers || 0, limit, false); setUsage("pages", u?.pages || 0, limit, false); setUsage("totalUsage", u?.total || 0, limit, true); $("usageNote").textContent = "同账号 Workers 和 Pages 共享免费 100K 请求额度，每日 GMT+8 刷新额度。"; }
+    function setUsage(prefix, value, limit, showLimit) { const pct = limit ? Math.min(100, value / limit * 100) : 0; $(prefix + "Bar").style.width = pct.toFixed(1) + "%"; $(prefix + "Pct").textContent = limit ? pct.toFixed(1) + "%" : "未配置"; $(prefix === "totalUsage" ? "totalUsage" : prefix + "Usage").textContent = limit ? (showLimit ? fmt(value) + " / " + fmt(limit) : fmt(value)) : "未配置 Account ID"; }
     $("refreshBtn").onclick = refresh;
     $("requestChartSource").onchange = renderCharts;
     $("accountSelect").onchange = () => { loadZones(); refresh(); };
@@ -1571,8 +1600,8 @@ const INDEX_HTML = `<!doctype html>
     $("aiConfirmNo").onclick = closeAiConfirm;
     $("aiConfirmMask").onclick = (event) => { if (event.target === $("aiConfirmMask")) closeAiConfirm(); };
     $("aiConfirmYes").onclick = async () => { const host = pendingAiHost; closeAiConfirm(); if (host) await runAiAnalysis(host); };
-    window.addEventListener("resize", () => { setTimeout(() => { if (chart) chart.resize(); if (trafficChart) trafficChart.resize(); }, 120); });
-    window.addEventListener("orientationchange", () => { setTimeout(() => { if (chart) chart.resize(); if (trafficChart) trafficChart.resize(); }, 260); });
+    window.addEventListener("resize", () => { setTimeout(resizeVisuals, 120); });
+    window.addEventListener("orientationchange", () => { setTimeout(resizeVisuals, 260); });
     init().catch(err => { $("aiResult").textContent = err.message; });
   </script>
 </body>
