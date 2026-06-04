@@ -98,9 +98,23 @@ async function accountsRoute(request, env) {
     await writeAccounts(env, result.accounts);
     return json({ account: publicAccount(result.account) });
   }
-  if (request.method === "DELETE") {
-    const id = new URL(request.url).searchParams.get("id");
+  if (request.method === "PATCH") {
+    const input = await request.json().catch(() => ({}));
     const accounts = await readAccounts(env);
+    const result = await addAccountZones(accounts, input, env);
+    await writeAccounts(env, result.accounts);
+    return json({ account: publicAccount(result.account), addedZones: result.addedZones });
+  }
+  if (request.method === "DELETE") {
+    const url = new URL(request.url);
+    const id = url.searchParams.get("id");
+    const zoneId = url.searchParams.get("zoneId");
+    const accounts = await readAccounts(env);
+    if (zoneId) {
+      const result = await removeAccountZone(accounts, id, zoneId, env);
+      await writeAccounts(env, result.accounts);
+      return json({ account: publicAccount(result.account) });
+    }
     await writeAccounts(env, accounts.filter((item) => item.id !== id));
     return json({ ok: true });
   }
@@ -734,8 +748,10 @@ ${verboseRule}
 
 数据口径：
 - httpRequests.totalRequests 是当前域名 HTTP 总请求，可能包含网页/API、静态资源、客户端探测、爬虫、扫描器，不等同于代理真实使用量。
+- httpRequests.totalBytes 是当前域名边缘响应流量，必须和请求数一起看；高请求但低流量更像探测、测速、保活或订阅刷新，不等同于真实代理大流量使用。
 - httpRequests.timeline 是逐小时趋势，用于判断峰值、回落和持续性。
 - httpRequests.fourHourBuckets 是 6 段每 4 小时数据，必须参与判断。
+- 每个 4 小时段的 count 与 bytes 必须一起判断；如果 count 偏高但 bytes 很低或 bytes/request 很低，优先解释为探测/保活/配置刷新。
 - topIPs 用于判断来源集中还是扩散。
 - topHosts 只作为流量分布参考。
 - topCountries 是客户端国家/地区聚合，用于辅助判断来源是否扩散。
@@ -768,6 +784,7 @@ ${verboseRule}
 - 来源略有扩散，但没有多个高请求 IP 同时存在。
 - 无法确认最大 IP 是否为用户本人出口。
 - 客户端探测/保活较频繁，但还不像外泄。
+- 请求数偏高但边缘响应流量很少，或流量与请求数不匹配。
 
 疑似节点外泄必须同时具备多项强证据：
 - 总请求量明显偏高。
@@ -795,12 +812,15 @@ ${verboseRule}
 客户端自动行为规则：
 - Clash、sing-box、Shadowrocket、Surge 等客户端可能产生 URLTest、自动测速、保活请求、订阅刷新、网络切换后重连。
 - 这类行为通常表现为多个时段低量、周期性、平峰仍有少量请求。
+- 如果判断可能是客户端探测，必须再看 totalBytes、timeline.bytes、fourHourBuckets.bytes。
+- 如果请求数偏高但 totalBytes 很小、各 4 小时段 bytes 很低、或平均每请求流量很低，应优先判断为“探测频率过高”或“节点/配置数量过多”，不要判断节点外泄。
+- 只有请求数高但流量低时，可能原因优先写“客户端探测/保活过于频繁”或“代理配置节点过多”。
 - 如果 Workers 用量接近免费额度 80%，但来源仍集中且像自动探测，应判断为“需要观察”，原因写“客户端探测/保活过于频繁”，不要直接判断外泄。
 
 低风险输出规则：
 - 判断正常或无异常时，不要写节点泄露、疑似泄露、被他人使用。
-- 可能原因只允许从以下短语选择：客户端探测/保活、订阅刷新、临时测速、爬虫扫描噪声、普通请求噪声、固定出口自用、Cloudflare 调度。
-- 建议只允许从以下短语选择：无需处理，继续常规观察、维持现状、观察后续是否持续、如最大 IP 是你的出口，则属正常、如高峰对应你的上网时段，则属正常。
+- 可能原因只允许从以下短语选择：客户端探测/保活、客户端探测/保活过于频繁、代理配置节点过多、订阅刷新、临时测速、爬虫扫描噪声、普通请求噪声、固定出口自用、Cloudflare 调度。
+- 建议只允许从以下短语选择：无需处理，继续常规观察、维持现状、观察后续是否持续、减少节点数量、拉长探测间隔、关闭频繁测速、如最大 IP 是你的出口，则属正常、如高峰对应你的上网时段，则属正常。
 
 风险等级：
 - 当前请求正常：低。
@@ -1136,11 +1156,42 @@ async function updateAccountLabels(accounts, input, env) {
   const data = await decryptJson(key, account.ciphertext);
   const zoneNames = new Map((input.zones || []).map((zone) => [String(zone.id || ""), String(zone.name || "").trim()]));
   data.zones = (data.zones || []).map((zone) => ({ ...zone, name: zoneNames.get(zone.id) || zone.name || "未命名区域" }));
+  if (input.accountId !== undefined) data.accountId = String(input.accountId).trim();
   const updated = {
     ...account,
     name: String(input.name || "").trim() || account.name,
     ciphertext: await encryptJson(key, data),
   };
+  const next = accounts.slice();
+  next[index] = updated;
+  return { accounts: next, account: await decryptAccount(updated, env) };
+}
+
+async function addAccountZones(accounts, input, env) {
+  const id = String(input.id || "");
+  const index = accounts.findIndex((account) => account.id === id);
+  if (index === -1) throw new Error("account_not_found");
+  const newZones = (input.zones || []).map((zone) => ({ id: crypto.randomUUID(), zoneTag: String(zone.zoneTag || "").trim(), name: String(zone.name || "").trim() || "未命名区域" })).filter((zone) => zone.zoneTag);
+  if (!newZones.length) throw new Error("no_valid_zones");
+  const key = await deriveKey(env);
+  const account = accounts[index];
+  const data = await decryptJson(key, account.ciphertext);
+  const byTag = new Map((data.zones || []).map((z) => [z.zoneTag, z]));
+  for (const zone of newZones) if (!byTag.has(zone.zoneTag)) { data.zones.push(zone); byTag.set(zone.zoneTag, zone); }
+  const updated = { ...account, ciphertext: await encryptJson(key, data) };
+  const next = accounts.slice();
+  next[index] = updated;
+  return { accounts: next, account: await decryptAccount(updated, env), addedZones: newZones.length };
+}
+
+async function removeAccountZone(accounts, accountId, zoneId, env) {
+  const index = accounts.findIndex((account) => account.id === accountId);
+  if (index === -1) throw new Error("account_not_found");
+  const key = await deriveKey(env);
+  const account = accounts[index];
+  const data = await decryptJson(key, account.ciphertext);
+  data.zones = (data.zones || []).filter((zone) => zone.id !== zoneId);
+  const updated = { ...account, ciphertext: await encryptJson(key, data) };
   const next = accounts.slice();
   next[index] = updated;
   return { accounts: next, account: await decryptAccount(updated, env) };
@@ -1434,6 +1485,7 @@ const INDEX_HTML = `<!doctype html>
     table { width:100%; border-collapse:collapse; table-layout:fixed; }
     th, td { padding:11px 8px; border-bottom:1px solid rgba(255,255,255,.08); text-align:left; overflow-wrap:anywhere; word-break:break-word; }
     th { color:var(--muted); font-weight:600; }
+    th { white-space:nowrap; word-break:keep-all; overflow-wrap:normal; }
     .ip-table col:nth-child(1) { width:48%; }
     .ip-table col:nth-child(2) { width:14%; }
     .ip-table col:nth-child(3) { width:22%; }
@@ -1470,7 +1522,7 @@ const INDEX_HTML = `<!doctype html>
     .overlay-panel.open { display:grid; }
     @media (max-width: 900px) { .toolbar, .cards, .split { grid-template-columns:1fr; } header { align-items:flex-start; flex-direction:column; } header > .row { margin-left:0; justify-content:flex-start; } }
     @media (max-width: 900px) { .usage-bars { grid-template-columns:1fr; } }
-    @media (max-width: 520px) { h1{font-size:28px}.panel{padding:14px;border-radius:18px}.usage-card{padding:14px}.usage-card strong{font-size:20px}.row a,.row button,button{width:100%;justify-content:center;text-align:center}.toolbar button{justify-self:stretch}.cards{gap:10px}#worldMap{height:clamp(240px,70vw,340px);min-height:240px}.map-legend{margin-top:4px} th,td{padding:10px 5px;font-size:13px}.ip-table col:nth-child(1){width:52%}.ip-table col:nth-child(2){width:11%}.ip-table col:nth-child(3){width:20%}.ip-table col:nth-child(4){width:17%}.host-table col:nth-child(1){width:60%}.host-table col:nth-child(2){width:22%}.host-table col:nth-child(3){width:18%} }
+    @media (max-width: 520px) { h1{font-size:28px}.panel{padding:14px;border-radius:18px}.usage-card{padding:14px}.usage-card strong{font-size:20px}.row a,.row button,button{width:100%;justify-content:center;text-align:center}.toolbar button{justify-self:stretch}.cards{gap:10px}#worldMap{height:clamp(240px,70vw,340px);min-height:240px}.map-legend{margin-top:4px} th,td{padding:10px 6px;font-size:13px}.ip-table col:nth-child(1){width:50%}.ip-table col:nth-child(2){width:12%}.ip-table col:nth-child(3){width:20%}.ip-table col:nth-child(4){width:18%}.host-table col:nth-child(1){width:58%}.host-table col:nth-child(2){width:23%}.host-table col:nth-child(3){width:19%} }
     @media (max-width: 900px) and (orientation: landscape) { #worldMap{height:clamp(220px,48vh,320px);min-height:220px} }
   </style>
 </head>
@@ -1578,9 +1630,10 @@ const INDEX_HTML = `<!doctype html>
     let worldMapColoredCodes = [];
     function countryColor(pct) { if (pct >= 50) return "rgba(94,234,212,1)"; if (pct >= 30) return "rgba(94,234,212,.82)"; if (pct >= 20) return "rgba(94,234,212,.66)"; if (pct >= 10) return "rgba(94,234,212,.5)"; if (pct >= 5) return "rgba(94,234,212,.34)"; if (pct >= 0.1) return "rgba(94,234,212,.22)"; return "rgba(94,234,212,.12)"; }
     function applyCountryColors(values, total) { if (!worldMapInstance?.regions) return; for (const code of worldMapColoredCodes) { if (worldMapInstance.regions[code]) worldMapInstance.regions[code].element.setStyle("fill", "rgba(219,234,254,.16)"); } worldMapColoredCodes = []; for (const [code, count] of Object.entries(values)) { if (!worldMapInstance.regions[code]) continue; worldMapInstance.regions[code].element.setStyle("fill", countryColor(Number(count || 0) / Math.max(Number(total || 0), 1) * 100)); worldMapColoredCodes.push(code); } }
+    function attachMapWheelZoom() { const el = $("worldMap"); if (!el || el.dataset.ctrlZoomBound === "1") return; el.dataset.ctrlZoomBound = "1"; el.addEventListener("wheel", (event) => { if (!event.ctrlKey || !worldMapInstance?._setScale) return; event.preventDefault(); const rect = el.getBoundingClientRect(); const x = event.clientX - rect.left; const y = event.clientY - rect.top; const factor = event.deltaY < 0 ? 1.25 : 0.8; worldMapInstance._setScale(worldMapInstance.scale * factor, x, y, false, worldMapInstance.params?.zoomAnimate); }, { passive: false }); }
     function countryCode(name) { const code = String(name || "").trim().toUpperCase(); if (/^[A-Z]{2}$/.test(code)) return code; return countryCodeMap[name] || ""; }
     function countryListHtml(list, total) { return '<table class="country-table"><colgroup><col><col><col></colgroup><thead><tr><th>国家</th><th>请求</th><th>占比</th></tr></thead><tbody>' + list.slice(0, 12).map((item) => { const name = item.dimensions.clientCountryName || "未知"; const count = Number(item.count || 0); return '<tr><td>' + escapeHtml(name) + '</td><td>' + fmt(count) + '</td><td>' + percentText(count, total) + '</td></tr>'; }).join("") + '</tbody></table>'; }
-    function renderCountryMap(items, total) { try { const list = (items || []).filter((item) => item?.dimensions?.clientCountryName).sort((a, b) => Number(b.count || 0) - Number(a.count || 0)).slice(0, 40); if (!list.length || !total) { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">暂无国家/地区分布数据</div>'; return; } const values = {}; const labels = {}; for (const item of list) { const name = item.dimensions.clientCountryName || "未知"; const code = countryCode(name); if (!code) continue; const count = Number(item.count || 0); values[code] = count; labels[code] = name + '：' + fmt(count) + '（' + percentText(count, total) + '）'; } const details = countryListHtml(list, total); if (!Object.keys(values).length) { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">暂无可映射到世界地图的国家数据</div>' + details; return; } if (typeof jsVectorMap !== "function") { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">世界地图资源加载失败，请刷新重试。</div>' + details; return; } worldMapLabels = labels; if (!worldMapInstance) { $("countryMap").innerHTML = '<div id="worldMap"></div><div class="map-legend"><span><i style="background:rgba(94,234,212,.22)"></i>0.1%+</span><span><i style="background:rgba(94,234,212,.34)"></i>5%+</span><span><i style="background:rgba(94,234,212,.5)"></i>10%+</span><span><i style="background:rgba(94,234,212,.66)"></i>20%+</span><span><i style="background:rgba(94,234,212,.82)"></i>30%+</span><span><i style="background:rgba(94,234,212,1)"></i>50%+</span></div><div id="countryRank"></div>'; worldMapInstance = new jsVectorMap({ selector: "#worldMap", map: "world_merc", backgroundColor: "transparent", zoomButtons: false, zoomOnScroll: false, regionStyle: { initial: { fill: "rgba(219,234,254,.16)", stroke: "rgba(148,163,184,.42)", strokeWidth: 0.65 }, hover: { stroke: "#5eead4", strokeWidth: 1.2 }, selected: { stroke: "#5eead4", strokeWidth: 1.2 } }, onRegionTooltipShow: (event, tooltip, code) => { if (worldMapLabels[code]) tooltip.text(worldMapLabels[code]); } }); $("countryRank").innerHTML = details; worldMapReady = true; setTimeout(() => { if (worldMapInstance) { worldMapInstance.updateSize(); applyCountryColors(values, total); } }, 60); return; } if (worldMapReady && worldMapInstance) { worldMapInstance.updateSize(); applyCountryColors(values, total); if ($("countryRank")) $("countryRank").innerHTML = details; } } catch (error) { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">世界地图渲染失败，请刷新重试。</div>'; } }
+    function renderCountryMap(items, total) { try { const list = (items || []).filter((item) => item?.dimensions?.clientCountryName).sort((a, b) => Number(b.count || 0) - Number(a.count || 0)).slice(0, 40); if (!list.length || !total) { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">暂无国家/地区分布数据</div>'; return; } const values = {}; const labels = {}; for (const item of list) { const name = item.dimensions.clientCountryName || "未知"; const code = countryCode(name); if (!code) continue; const count = Number(item.count || 0); values[code] = count; labels[code] = name + '：' + fmt(count) + '（' + percentText(count, total) + '）'; } const details = countryListHtml(list, total); if (!Object.keys(values).length) { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">暂无可映射到世界地图的国家数据</div>' + details; return; } if (typeof jsVectorMap !== "function") { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">世界地图资源加载失败，请刷新重试。</div>' + details; return; } worldMapLabels = labels; if (!worldMapInstance) { $("countryMap").innerHTML = '<div id="worldMap"></div><div class="map-legend"><span><i style="background:rgba(94,234,212,.22)"></i>0.1%+</span><span><i style="background:rgba(94,234,212,.34)"></i>5%+</span><span><i style="background:rgba(94,234,212,.5)"></i>10%+</span><span><i style="background:rgba(94,234,212,.66)"></i>20%+</span><span><i style="background:rgba(94,234,212,.82)"></i>30%+</span><span><i style="background:rgba(94,234,212,1)"></i>50%+</span></div><div id="countryRank"></div>'; worldMapInstance = new jsVectorMap({ selector: "#worldMap", map: "world_merc", backgroundColor: "transparent", zoomButtons: false, zoomOnScroll: false, regionStyle: { initial: { fill: "rgba(219,234,254,.16)", stroke: "rgba(148,163,184,.42)", strokeWidth: 0.65 }, hover: { stroke: "#5eead4", strokeWidth: 1.2 }, selected: { stroke: "#5eead4", strokeWidth: 1.2 } }, onRegionTooltipShow: (event, tooltip, code) => { if (worldMapLabels[code]) tooltip.text(worldMapLabels[code]); } }); attachMapWheelZoom(); $("countryRank").innerHTML = details; worldMapReady = true; setTimeout(() => { if (worldMapInstance) { worldMapInstance.updateSize(); applyCountryColors(values, total); } }, 60); return; } if (worldMapReady && worldMapInstance) { attachMapWheelZoom(); worldMapInstance.updateSize(); applyCountryColors(values, total); if ($("countryRank")) $("countryRank").innerHTML = details; } } catch (error) { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">世界地图渲染失败，请刷新重试。</div>'; } }
     function render(s, hours, usage, available = true, projectMetrics = null, workerMetrics = null) { currentSummary = s; currentProjectMetrics = projectMetrics; currentWorkerMetrics = workerMetrics; currentAvailable = available; const scope = selectedScopeText(); if (projectMetrics?.matched) $("requestChartSource").value = "worker"; $("requestScopeText").textContent = scope; $("trafficScopeText").textContent = scope; $("workersScopeText").textContent = scope; $("pagesScopeText").textContent = scope; $("totalRequests").textContent = fmt(projectMetrics?.totalRequests ?? s.totalRequests); $("totalBytes").textContent = bytes(s.totalBytes); $("rangeText").textContent = hours + "h"; renderUsage(usage, projectMetrics); $("analysisBlocked").classList.toggle("privacy-hidden", available); $("aiBtn").disabled = !available; $("chartPanel").classList.toggle("blocked", !available); $("trafficChartPanel").classList.toggle("blocked", !available); $("countryPanel").classList.toggle("blocked", !available); $("ipTableWrap").classList.toggle("blocked", !available); $("hostTableWrap").classList.toggle("blocked", !available); $("ipTable").innerHTML = s.topIPs.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientIP) + '</td><td>' + escapeHtml(x.dimensions.clientCountryName||"-") + '</td><td>' + fmt(x.count) + '</td><td>' + percentText(Number(x.count || 0), s.totalRequests) + '</td></tr>').join(""); $("hostTable").innerHTML = s.topHosts.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientRequestHTTPHost) + '</td><td>' + fmt(x.count) + '</td><td>' + percentText(Number(x.count || 0), s.totalRequests) + '</td></tr>').join(""); try { renderCharts(); } catch (error) { $("requestChartNote").textContent = "折线图渲染失败，请刷新重试。"; } renderCountryMap(s.topCountries, s.totalRequests); }
     function chartOptions(formatter = fmt) { return { responsive:true, maintainAspectRatio:false, plugins:{ legend:{ labels:{ color:"#dbeafe" } }, tooltip:{ callbacks:{ label:(ctx) => ctx.dataset.label + "：" + formatter(ctx.parsed.y) } } }, scales:{ x:{ ticks:{ color:"#8ea3c3", maxTicksLimit:8 }, grid:{ color:"rgba(255,255,255,.06)" } }, y:{ ticks:{ color:"#8ea3c3", callback:(value) => formatter(value) }, grid:{ color:"rgba(255,255,255,.06)" } } } }; }
     function renderLine(target, series, valueKey, label, color, formatter = fmt, total = null) { const labels = series.map(x => shortBeijingTime(x.time)); const values = series.map(x => Number(x[valueKey] || 0)); return new Chart($(target), { type:"line", data:{ labels, datasets:[{ label, data:values, borderColor:color, backgroundColor:color === "#5eead4" ? "rgba(94,234,212,.16)" : "rgba(96,165,250,.14)", tension:.28, fill:true }] }, options:chartOptions(formatter) }); }
@@ -1663,9 +1716,9 @@ const ADMIN_PANEL_HTML = `<!doctype html>
       <div class="row"><button id="addAccountBtn" type="button">验证并保存</button></div>
       <div id="accountMsg" class="msg"></div>
     </section>
-    <section class="panel grid">
+    <section>
       <h2>账号列表</h2>
-      <div id="accounts" class="msg">加载中...</div>
+      <div id="accounts" class="msg" style="display:grid;gap:14px">加载中...</div>
     </section>
     <section class="panel grid">
       <h2>公开隐私设置</h2>
@@ -1714,12 +1767,15 @@ const ADMIN_PANEL_HTML = `<!doctype html>
         $("accounts").textContent = "暂无账号";
         return;
       }
-      $("accounts").innerHTML = data.accounts.map((account) => '<div class="account" data-account="' + escapeHtml(account.id) + '"><div class="grid" style="flex:1;min-width:260px"><label>账号显示名称<input data-account-name value="' + escapeHtml(account.name) + '"></label><small>' + escapeHtml(account.createdAt || "") + (account.hasAccountId ? ' · 已配置 Account ID' : ' · 未配置 Account ID') + '</small>' + (account.zones || []).map((zone) => '<label>区域显示名称<input data-zone-id="' + escapeHtml(zone.id) + '" value="' + escapeHtml(zone.name) + '"></label>').join("") + '</div><div class="row"><button class="secondary" type="button" data-save-id="' + escapeHtml(account.id) + '">保存名称</button><button class="danger" type="button" data-id="' + escapeHtml(account.id) + '">删除</button></div></div>').join("");
+      $("accounts").innerHTML = data.accounts.map((account, ai) => '<div class="panel" data-account="' + escapeHtml(account.id) + '" style="display:grid;gap:12px;width:100%;border:1px solid var(--line);border-radius:22px;padding:20px;background:var(--panel)"><label><span style="color:var(--muted)">#' + (ai + 1) + ' 账号显示名称</span><input data-account-name value="' + escapeHtml(account.name) + '" style="margin-top:4px"></label><small>' + escapeHtml(account.createdAt || "") + (account.hasAccountId ? ' · 已配置 Account ID' : ' · 未配置 Account ID') + '</small>' + (account.zones || []).map((zone, zi) => '<div' + (zi ? ' style="border-top:1px solid var(--line);padding-top:8px;margin-top:4px"' : '') + '><div style="display:grid;gap:6px"><span style="color:var(--muted)">区域 ' + (zi + 1) + '</span><input data-zone-id="' + escapeHtml(zone.id) + '" value="' + escapeHtml(zone.name) + '"><button type="button" data-delete-zone="' + escapeHtml(account.id) + '|' + escapeHtml(zone.id) + '" class="secondary" style="width:100%">删除区域</button></div></div>').join("") + '<div style="background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:14px;display:grid;gap:10px;width:100%">' + (account.hasAccountId ? '' : '<label><div style="color:var(--muted);margin-bottom:4px">Cloudflare Account ID</div><input data-account-id value=""></label><button type="button" data-save-account-id="' + escapeHtml(account.id) + '" class="secondary">保存 Account ID</button>') + '<label><div style="color:var(--muted);margin-bottom:4px">添加区域</div><input data-add-zone placeholder="区域 ID 或 ZoneID#名称"></label><button type="button" data-add-zones-id="' + escapeHtml(account.id) + '" class="secondary">添加区域</button></div><div class="row" style="width:100%;flex-direction:column"><button class="secondary" type="button" data-save-id="' + escapeHtml(account.id) + '" style="width:100%">保存名称</button><button class="danger" type="button" data-id="' + escapeHtml(account.id) + '" style="width:100%">删除</button></div></div>').join("");
       document.querySelectorAll("button[data-save-id]").forEach((button) => {
         button.addEventListener("click", async () => {
           const wrap = document.querySelector('[data-account="' + button.dataset.saveId + '"]');
           const zones = [...wrap.querySelectorAll("input[data-zone-id]")].map((input) => ({ id: input.dataset.zoneId, name: input.value.trim() }));
-          await api("/api/accounts", { method: "PUT", body: JSON.stringify({ id: button.dataset.saveId, name: wrap.querySelector("input[data-account-name]").value.trim(), zones }) });
+          const accountIdInput = wrap.querySelector("input[data-account-id]");
+          const body = { id: button.dataset.saveId, name: wrap.querySelector("input[data-account-name]").value.trim(), zones };
+          if (accountIdInput) body.accountId = accountIdInput.value.trim();
+          await api("/api/accounts", { method: "PUT", body: JSON.stringify(body) });
           await loadAccounts();
         });
       });
@@ -1730,6 +1786,47 @@ const ADMIN_PANEL_HTML = `<!doctype html>
           const name = wrap?.querySelector("input[data-account-name]")?.value || "未命名账号";
           $("deleteConfirmName").textContent = name;
           $("deleteConfirmMask").classList.add("open");
+        });
+      });
+      document.querySelectorAll("button[data-add-zones-id]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const wrap = document.querySelector('[data-account="' + button.dataset.addZonesId + '"]');
+          const input = wrap?.querySelector("input[data-add-zone]");
+          if (!input) return;
+          const raw = input.value.trim();
+          if (!raw) return;
+          const parts = raw.split("#");
+          const zoneTag = (parts.shift() || "").trim();
+          const name = parts.join("#").trim() || "未命名区域";
+          if (!zoneTag) return;
+          try {
+            await api("/api/accounts", { method: "PATCH", body: JSON.stringify({ id: button.dataset.addZonesId, zones: [{ zoneTag, name }] }) });
+            input.value = "";
+            await loadAccounts();
+          } catch (error) { alert(error.message); }
+        });
+      });
+      document.querySelectorAll("button[data-delete-zone]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const [accountId, zoneId] = button.dataset.deleteZone.split("|");
+          if (!accountId || !zoneId) return;
+          try {
+            await api("/api/accounts?id=" + encodeURIComponent(accountId) + "&zoneId=" + encodeURIComponent(zoneId), { method: "DELETE" });
+            await loadAccounts();
+          } catch (error) { alert(error.message); }
+        });
+      });
+      document.querySelectorAll("button[data-save-account-id]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const wrap = document.querySelector('[data-account="' + button.dataset.saveAccountId + '"]');
+          const input = wrap?.querySelector("input[data-account-id]");
+          if (!input) return;
+          const val = input.value.trim();
+          if (!val) return;
+          try {
+            await api("/api/accounts", { method: "PUT", body: JSON.stringify({ id: button.dataset.saveAccountId, accountId: val }) });
+            await loadAccounts();
+          } catch (error) { alert(error.message); }
         });
       });
     }
