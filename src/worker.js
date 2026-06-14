@@ -1,5 +1,6 @@
 const CONFIG_KEY = "accounts:v1";
 const PRIVACY_KEY = "privacy:v1";
+const CRON_KEY = "cron:v1";
 const SESSION_TTL = 60 * 60 * 24;
 const RANGE_HOURS = new Set([1, 6, 12, 24, 72, 168]);
 const GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
@@ -8,7 +9,7 @@ const DAILY_REQUEST_LIMIT = 100000;
 const NO_ACCOUNT_MESSAGE = "当前还没有账号配置。请先登录后台添加 Cloudflare 账号后再查看分析或使用 AI 分析。";
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
       if (!env.ADMIN_PASSWORD) return setupRequiredPage();
@@ -28,11 +29,21 @@ export default {
       if (url.pathname === "/usage.json" || url.pathname === "/api/usage") return await usageRoute(request, env);
       if (url.pathname === "/api/analytics") return await analyticsRoute(request, env);
       if (url.pathname === "/api/ai/analyze" && request.method === "POST") return await aiRoute(request, env);
+      if (url.pathname === "/api/cron-config") return await cronConfigRoute(request, env, ctx);
+      if (url.pathname === "/api/cron/trigger") {
+        const key = url.searchParams.get("key") || request.headers.get("X-Cron-Key") || "";
+        if (!env.CRON_SECRET || key !== env.CRON_SECRET) return json({ error: "unauthorized" }, 401);
+        ctx.waitUntil(handleCron(env));
+        return json({ ok: true, message: "采集已触发" });
+      }
       if (url.pathname === "/robots.txt") return text("User-agent: *\nDisallow: /\n");
       return json({ error: "not_found" }, 404);
     } catch (error) {
       return json({ error: "internal_error", message: safeErrorMessage(error) }, 500);
     }
+  },
+  async scheduled(event, env, ctx) {
+    await handleCron(env);
   },
 };
 
@@ -134,6 +145,25 @@ async function privacyRoute(request, env) {
   return json({ error: "method_not_allowed" }, 405);
 }
 
+async function cronConfigRoute(request, env, ctx) {
+  if (request.method === "GET") {
+    const cfg = await readCronConfig(env);
+    return json({ config: cfg });
+  }
+  if (!(await isAdmin(request, env))) return json({ error: "unauthorized" }, 401);
+  if (request.method === "PUT") {
+    const input = await request.json().catch(() => ({}));
+    const cfg = { ...defaultCronConfig(), ...input, interval: Math.max(0, Math.min(168, Number(input.interval) || 24)) };
+    await writeCronConfig(env, cfg);
+    return json({ config: cfg });
+  }
+  if (request.method === "POST") {
+    ctx.waitUntil(handleCron(env));
+    return json({ ok: true, message: "定时采集任务已触发。" });
+  }
+  return json({ error: "method_not_allowed" }, 405);
+}
+
 async function usageRoute(request, env) {
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: usageCorsHeaders() });
   const accounts = await readAccounts(env);
@@ -172,12 +202,13 @@ async function analyticsRoute(request, env) {
   const usableAccounts = decrypted.accounts;
   const scopedAccounts = usableAccounts.map((account) => filterAccountZones(account, zoneId));
   const analyzableAccounts = scopedAccounts.filter((account) => (account.zones || []).length);
-  const results = await Promise.all(analyzableAccounts.map((account) => loadAccountAnalytics(account, hours, host)));
+  const results = await Promise.all(analyzableAccounts.map((account) => loadAccountAnalytics(account, hours, host, false, env)));
   const summary = mergeAnalytics(results, hours);
-  const projectMetrics = projectName ? await loadWorkerProjectMetrics(usableAccounts, projectName, hours) : null;
-  const workerMetrics = projectMetrics || await loadWorkerAccountMetrics(usableAccounts, hours);
+  const projectMetrics = projectName ? await loadWorkerProjectMetrics(usableAccounts, projectName, hours, env) : null;
+  const workerMetrics = projectMetrics || await loadWorkerAccountMetrics(usableAccounts, hours, env);
   const usage = projectMetrics ? projectUsageSummary(await loadUsageSummary(usableAccounts), projectMetrics) : await loadUsageSummary(usableAccounts);
-  const body = { generatedAt: beijingNow(), hours, host, projectName, zone: zoneId, accounts: results.map(stripSecrets), summary: withBeijingTimeline(summary), usage, projectMetrics, workerMetrics, analyticsAvailable: analyzableAccounts.length > 0, privacy };
+  const fallbackTo24h = results.some((r) => r.fallbackTo24h) || (workerMetrics?.fallbackTo24h ?? false);
+  const body = { generatedAt: beijingNow(), hours, host, projectName, zone: zoneId, accounts: results.map(stripSecrets), summary: withBeijingTimeline(summary), usage, projectMetrics, workerMetrics, analyticsAvailable: analyzableAccounts.length > 0, privacy, fallbackTo24h };
   return json(privateView ? body : redactForPublic(body, privacy));
 }
 
@@ -185,6 +216,7 @@ async function aiRoute(request, env) {
   if (!(await isAdmin(request, env))) return json({ error: "unauthorized" }, 401);
   if (!hasAiBinding(env)) return json({ error: "missing_AI_binding", message: "当前 Pages 项目未绑定 Workers AI，请根据仓库 README 在 Functions 设置中添加 AI 绑定后重新部署。" }, 500);
   const body = await request.json().catch(() => ({}));
+  const hours = parseHours(body.hours || 24);
   const host = cleanHost(body.host || "");
   const projectName = cleanProjectName(body.projectName || "");
   const privacy = await readPrivacy(env);
@@ -200,9 +232,9 @@ async function aiRoute(request, env) {
   const accountName = usableAccounts.map((account) => account.name || account.id).filter(Boolean).join("、") || body.account;
   const scopedAccounts = usableAccounts.map((account) => filterAccountZones(account, zoneId));
   if (!scopedAccounts.some((account) => (account.zones || []).length)) return json({ error: "no_zone_for_analysis", message: "当前账号未配置区域 ID，无法进行域名请求明细和 AI 分析。" }, 400);
-  const data = await Promise.all(scopedAccounts.map((account) => loadAccountAnalytics(account, 24, host, true)));
-  const summary = mergeAnalytics(data, 24);
-  const projectMetrics = await loadWorkerProjectMetrics(scopedAccounts, projectName, 24);
+  const data = await Promise.all(scopedAccounts.map((account) => loadAccountAnalytics(account, hours, host, true, env)));
+  const summary = mergeAnalytics(data, hours);
+  const projectMetrics = await loadWorkerProjectMetrics(scopedAccounts, projectName, hours);
   if (!projectMetrics.matched) return json({ error: "project_metrics_empty", message: "服务名 / 项目名参数错误，无法成功获取该服务的项目级 Workers metrics 数据。" }, 400);
   const usage = projectUsageSummary(await loadUsageSummary(scopedAccounts), projectMetrics);
   const aiInput = { host, zone: zoneId, verbose, filter: { host, account: body.account || "all", accountName, zone: zoneId, projectName }, httpRequests: withAiTimeBuckets(summary, data), projectMetrics, workerUsage: compactUsageForAI(usage), accounts: data.map(stripSecrets) };
@@ -246,15 +278,33 @@ function extractAiText(value) {
   return String(value || "");
 }
 
-async function loadAccountAnalytics(account, hours, host, includeAiBuckets = false) {
+async function loadAccountAnalytics(account, hours, host, includeAiBuckets = false, env = null) {
   const { start, end } = timeRange(hours);
   const bucketRanges = includeAiBuckets ? buildBucketRanges(start, end) : [];
-  const zoneResults = await Promise.all(account.zones.map((zone) => queryZone(account, zone, start, end, hours, host, bucketRanges)));
+  const useMinute = hours === 1;
+  let fallback = false;
+  const zoneResults = await Promise.all(account.zones.map(async (zone) => {
+    const queryStart = useMinute ? start : new Date(Math.max(new Date(start).getTime(), new Date(end).getTime() - 24 * 3600000)).toISOString().replace(/\.\d{3}Z$/, "Z");
+    const fresh = await queryZone(account, zone, queryStart, end, Math.min(hours, 24), host, useMinute ? bucketRanges : []);
+    let fullTimeline = fresh.timeline;
+    if (env?.KV && start !== queryStart) {
+      const hist = await loadTimeline(env, histHttpKey, zone.zoneTag, start, queryStart);
+      if (hist.length) {
+        fullTimeline = fillRange(mergeTimelineHours(hist, fresh.timeline), start, end, hours);
+      } else {
+        fallback = true;
+        fullTimeline = fillRange(fresh.timeline, queryStart, end, hours);
+      }
+    }
+    saveTimeline(env, histHttpKey, zone.zoneTag, fullTimeline);
+    return { ...fresh, timeline: fullTimeline };
+  }));
   return {
     id: account.id,
     name: account.name,
     zones: zoneResults,
     totals: mergeAnalytics(zoneResults, hours),
+    fallbackTo24h: fallback,
   };
 }
 
@@ -318,10 +368,27 @@ function sumRequests(rows) {
   return (rows || []).reduce((total, row) => total + Number(row?.sum?.requests || 0), 0);
 }
 
-async function loadWorkerAccountMetrics(accounts, hours) {
+async function loadWorkerAccountMetrics(accounts, hours, env = null) {
   const { start, end } = timeRange(hours);
   const configured = accounts.filter((account) => account.accountId);
-  const rows = await Promise.all(configured.map((account) => queryWorkerAccountMetrics(account, start, end).catch((error) => ({ accountId: account.id, name: account.name, totalRequests: 0, timeline: [], fourHourBuckets: [], error: error.message }))));
+  let fallback = false;
+  const rows = await Promise.all(configured.map(async (account) => {
+    const queryStart = new Date(Math.max(new Date(start).getTime(), new Date(end).getTime() - 24 * 3600000)).toISOString().replace(/\.\d{3}Z$/, "Z");
+    const fresh = await queryWorkerAccountMetrics(account, queryStart, end).catch((error) => ({ accountId: account.id, name: account.name, totalRequests: 0, timeline: [], fourHourBuckets: [], error: error.message }));
+    let fullTimeline = fresh.timeline || [];
+    if (env?.KV && start !== queryStart && !fresh.error) {
+      const hist = await loadTimeline(env, histWorkerKey, account.accountId, start, queryStart);
+      if (hist.length) {
+        const merged = mergeTimelineHours(hist, fresh.timeline);
+        fullTimeline = fillRange(merged, start, end, 24);
+      } else {
+        fallback = true;
+        fullTimeline = fillRange(fresh.timeline, queryStart, end, 24);
+      }
+    }
+    if (!fresh.error) saveTimeline(env, histWorkerKey, account.accountId, fullTimeline);
+    return { ...fresh, timeline: fullTimeline, totalRequests: fullTimeline.reduce((s, p) => s + Number(p.count || 0), 0) };
+  }));
   const timeline = mergeProjectTimeline(rows);
   return {
     projectName: "",
@@ -330,6 +397,7 @@ async function loadWorkerAccountMetrics(accounts, hours) {
     timeline,
     fourHourBuckets: mergeProjectBuckets(rows),
     accounts: rows,
+    fallbackTo24h: fallback,
     note: "未指定 Service 名称，按当前筛选账号汇总 Workers 请求折线。",
   };
 }
@@ -348,10 +416,27 @@ async function queryWorkerAccountMetrics(account, start, end) {
   };
 }
 
-async function loadWorkerProjectMetrics(accounts, projectName, hours) {
+async function loadWorkerProjectMetrics(accounts, projectName, hours, env = null) {
   const { start, end } = timeRange(hours);
   const configured = accounts.filter((account) => account.accountId);
-  const rows = await Promise.all(configured.map((account) => queryWorkerProjectMetrics(account, projectName, start, end).catch((error) => ({ accountId: account.id, name: account.name, projectName, totalRequests: 0, timeline: [], fourHourBuckets: [], error: error.message }))));
+  let fallback = false;
+  const rows = await Promise.all(configured.map(async (account) => {
+    const queryStart = new Date(Math.max(new Date(start).getTime(), new Date(end).getTime() - 24 * 3600000)).toISOString().replace(/\.\d{3}Z$/, "Z");
+    const fresh = await queryWorkerProjectMetrics(account, projectName, queryStart, end).catch((error) => ({ accountId: account.id, name: account.name, projectName, totalRequests: 0, timeline: [], fourHourBuckets: [], error: error.message }));
+    let fullTimeline = fresh.timeline || [];
+    if (env?.KV && start !== queryStart && !fresh.error) {
+      const hist = await loadTimeline(env, histProjectKey, `${account.accountId}:${projectName}`, start, queryStart);
+      if (hist.length) {
+        const merged = mergeTimelineHours(hist, fresh.timeline);
+        fullTimeline = fillRange(merged, start, end, 24);
+      } else {
+        fallback = true;
+        fullTimeline = fillRange(fresh.timeline, queryStart, end, 24);
+      }
+    }
+    if (!fresh.error) saveTimeline(env, histProjectKey, `${account.accountId}:${projectName}`, fullTimeline);
+    return { ...fresh, timeline: fullTimeline, totalRequests: fullTimeline.reduce((s, p) => s + Number(p.count || 0), 0) };
+  }));
   const totalRequests = rows.reduce((sum, row) => sum + Number(row.totalRequests || 0), 0);
   const matched = totalRequests > 0;
   return {
@@ -361,6 +446,7 @@ async function loadWorkerProjectMetrics(accounts, projectName, hours) {
     timeline: mergeProjectTimeline(rows),
     fourHourBuckets: mergeProjectBuckets(rows),
     accounts: rows,
+    fallbackTo24h: fallback,
     note: matched ? "已匹配指定 Service 的项目级 Workers metrics。" : "指定 Service 当前时间范围内无匹配请求数据。",
   };
 }
@@ -1285,6 +1371,50 @@ function normalizePrivacy(input) {
   };
 }
 
+function defaultCronConfig() {
+  return { enabled: true, interval: 24, lastRun: null };
+}
+
+async function readCronConfig(env) {
+  const defaults = defaultCronConfig();
+  if (!env.KV) return { ...defaults, enabled: false, note: "KV 未绑定" };
+  try {
+    const raw = await env.KV.get(CRON_KEY);
+    if (!raw) return defaults;
+    return { ...defaults, ...JSON.parse(raw) };
+  } catch { return defaults; }
+}
+
+async function writeCronConfig(env, cfg) {
+  if (!env.KV) return;
+  await env.KV.put(CRON_KEY, JSON.stringify(cfg));
+}
+
+async function handleCron(env) {
+  const cfg = await readCronConfig(env);
+  if (!cfg.enabled || !cfg.interval) return;
+  const now = Date.now();
+  if (cfg.lastRun && (now - cfg.lastRun) < cfg.interval * 3600000) return;
+  const accounts = await readAccounts(env);
+  const { accounts: usable } = await decryptAccountsSafely(accounts, env);
+  const { start, end } = timeRange(24);
+  for (const account of usable) {
+    for (const zone of (account.zones || [])) {
+      try {
+        const result = await queryZone(account, zone, start, end, 24, "");
+        await saveTimeline(env, histHttpKey, zone.zoneTag, result.timeline);
+      } catch {}
+    }
+    if (account.accountId) {
+      try {
+        const result = await queryWorkerAccountMetrics(account, start, end);
+        await saveTimeline(env, histWorkerKey, account.accountId, result.timeline);
+      } catch {}
+    }
+  }
+  await writeCronConfig(env, { ...cfg, lastRun: now });
+}
+
 function redactForPublic(body, privacy) {
   const safe = structuredClone(body);
   if (!privacy.publicTimeline) {
@@ -1374,6 +1504,65 @@ function floorTime(ms, stepMs) {
 
 function ceilTime(ms, stepMs) {
   return Math.ceil(ms / stepMs) * stepMs;
+}
+
+function histHttpKey(zoneTag, date) { return `hist:http:${zoneTag}:${date}`; }
+function histWorkerKey(accountId, date) { return `hist:worker:${accountId}:${date}`; }
+function histProjectKey(accountId, project, date) { return `hist:project:${accountId}:${project}:${date}`; }
+
+async function saveTimeline(env, keyFn, qualifier, timeline) {
+  if (!env?.KV) return;
+  const byDate = {};
+  for (const p of timeline) {
+    const t = p.time || p.hour;
+    if (!t) continue;
+    const date = String(t).slice(0, 10);
+    if (!byDate[date]) byDate[date] = [];
+    byDate[date].push(p);
+  }
+  for (const [date, points] of Object.entries(byDate)) {
+    const key = keyFn(qualifier, date);
+    try {
+      const existing = await env.KV.get(key, "json") || [];
+      const merged = mergeTimelineHours(existing, points);
+      await env.KV.put(key, JSON.stringify(merged), { expirationTtl: 86400 * 35 });
+    } catch {}
+  }
+}
+
+async function loadTimeline(env, keyFn, qualifier, startDate, endDate) {
+  if (!env?.KV) return [];
+  const all = [];
+  let d = new Date(startDate);
+  const end = new Date(endDate);
+  while (d < end) {
+    const key = keyFn(qualifier, d.toISOString().slice(0, 10));
+    try {
+      const data = await env.KV.get(key, "json");
+      if (data) all.push(...data);
+    } catch {}
+    d.setDate(d.getDate() + 1);
+  }
+  return all;
+}
+
+function mergeTimelineHours(existing, incoming) {
+  const byHour = {};
+  for (const p of existing) byHour[p.time || p.hour] = p;
+  for (const p of incoming) byHour[p.time || p.hour] = p;
+  return Object.values(byHour).sort((a, b) => (a.time || a.hour).localeCompare(b.time || b.hour));
+}
+
+function fillRange(points, start, end, hours) {
+  const stepMs = hours === 1 ? 60000 : 3600000;
+  const byTime = new Map();
+  for (const p of points) byTime.set(p.time || p.hour, p);
+  const out = [];
+  for (let t = floorTime(new Date(start).getTime(), stepMs); t < new Date(end).getTime(); t += stepMs) {
+    const key = new Date(t).toISOString().replace(/\.000Z$/, "Z");
+    out.push(byTime.get(key) || { time: key, count: 0, bytes: 0 });
+  }
+  return out;
 }
 
 async function isAdmin(request, env) {
@@ -1574,7 +1763,7 @@ const INDEX_HTML = `<!doctype html>
       <button id="refreshBtn">应用筛选</button>
     </section>
     <section class="panel" id="aiPanel">
-      <div class="row" style="justify-content:space-between"><h3>AI 分析</h3><button id="aiBtn" class="admin-only">AI 分析 24h</button></div>
+      <div class="row" style="justify-content:space-between"><h3>AI 分析</h3><button id="aiBtn" class="admin-only">AI 分析 <span id="aiHourLabel">24h</span></button></div>
       <div id="aiResult" class="notice muted">管理员登录后可基于当前筛选域名的 24 小时数据分析异常盗用、自动探测或正常波动。</div>
       <div id="analysisBlocked" class="notice muted privacy-hidden">当前账号未配置区域 ID，只能显示 Workers/Pages 用量进度，无法展示域名请求明细或 AI 分析。</div>
     </section>
@@ -1653,7 +1842,7 @@ const INDEX_HTML = `<!doctype html>
     function loadZones() { const accountId = $("accountSelect").value; const accounts = accountId === "all" ? accountCache : accountCache.filter(a => a.id === accountId); const zones = accounts.flatMap(a => (a.zones || []).map(z => ({ id:z.id, name:(accountId === "all" ? a.name + " / " : "") + (z.name || "未命名区域") }))); $("zoneSelect").innerHTML = '<option value="all">全部区域汇总</option>' + zones.map(z => '<option value="' + escapeHtml(z.id) + '">' + escapeHtml(z.name) + '</option>').join(""); }
     function emptyDashboardSummary() { return { totalRequests:0, totalBytes:0, timeline:[], topIPs:[], topHosts:[], topCountries:[] }; }
     function selectedScopeText() { const account = $("accountSelect").options[$("accountSelect").selectedIndex]?.textContent || "全部账号汇总"; const zone = $("zoneSelect").options[$("zoneSelect").selectedIndex]?.textContent || "全部区域汇总"; return account + " / " + zone; }
-    async function refresh() { const q = new URLSearchParams({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours: $("rangeSelect").value, host: $("hostInput").value.trim(), projectName: $("projectInput").value.trim() }); try { const data = await api("/api/analytics?" + q); render(data.summary, data.hours, data.usage, data.analyticsAvailable !== false, data.projectMetrics, data.workerMetrics); } catch (err) { if (err.code === "no_account") { render(emptyDashboardSummary(), $("rangeSelect").value, { workers:0, pages:0, total:0, limit:0 }, false, null, null); $("analysisBlocked").textContent = err.message; return; } throw err; } }
+    async function refresh() { const q = new URLSearchParams({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours: $("rangeSelect").value, host: $("hostInput").value.trim(), projectName: $("projectInput").value.trim() }); try { const data = await api("/api/analytics?" + q); if (data.fallbackTo24h) { for (const v of ["72", "168"]) { const opt = $("rangeSelect").querySelector('option[value="' + v + '"]'); if (opt) opt.disabled = true; } if (["72", "168"].includes($("rangeSelect").value)) $("rangeSelect").value = "24"; } else { for (const v of ["72", "168"]) { const opt = $("rangeSelect").querySelector('option[value="' + v + '"]'); if (opt) opt.disabled = false; } } render(data.summary, data.hours, data.usage, data.analyticsAvailable !== false, data.projectMetrics, data.workerMetrics); } catch (err) { if (err.code === "no_account") { render(emptyDashboardSummary(), $("rangeSelect").value, { workers:0, pages:0, total:0, limit:0 }, false, null, null); $("analysisBlocked").textContent = err.message; return; } throw err; } }
     function shortBeijingTime(value) { const text = String(value || "").replace("T", " "); const match = text.match(/^(?:[0-9]{4}-)?([0-9]{2}-[0-9]{2})[ ]+([0-9]{2}:[0-9]{2})/); return match ? match[1] + " " + match[2] : text.replace(/^[0-9]{4}-/, "").replace(/:[0-9]{2}(?:[ ]+GMT[+]8|Z)?$/, ""); }
     function formatRangeText(hours) { if (hours % 24 === 0) return hours / 24 + " 天"; return hours + "h"; }
     function percentText(count, total) { if (!total) return "0.0%"; const pct = count / total * 100; return pct < 0.1 ? "＜0.1%" : pct.toFixed(pct >= 10 ? 0 : 1) + "%"; }
@@ -1668,9 +1857,9 @@ const INDEX_HTML = `<!doctype html>
     function countryCode(name) { const code = String(name || "").trim().toUpperCase(); if (/^[A-Z]{2}$/.test(code)) return code; return countryCodeMap[name] || ""; }
     function countryListHtml(list, total) { return '<table class="country-table"><colgroup><col><col><col></colgroup><thead><tr><th>国家</th><th>请求</th><th>占比</th></tr></thead><tbody>' + list.slice(0, 12).map((item) => { const name = item.dimensions.clientCountryName || "未知"; const count = Number(item.count || 0); return '<tr><td>' + escapeHtml(name) + '</td><td>' + fmt(count) + '</td><td>' + percentText(count, total) + '</td></tr>'; }).join("") + '</tbody></table>'; }
     function renderCountryMap(items, total) { try { const list = (items || []).filter((item) => item?.dimensions?.clientCountryName).sort((a, b) => Number(b.count || 0) - Number(a.count || 0)).slice(0, 40); if (!list.length || !total) { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">暂无国家/地区分布数据</div>'; return; } const values = {}; const labels = {}; for (const item of list) { const name = item.dimensions.clientCountryName || "未知"; const code = countryCode(name); if (!code) continue; const count = Number(item.count || 0); values[code] = count; labels[code] = name + '：' + fmt(count) + '（' + percentText(count, total) + '）'; } const details = countryListHtml(list, total); if (!Object.keys(values).length) { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">暂无可映射到世界地图的国家数据</div>' + details; return; } if (typeof jsVectorMap !== "function") { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">世界地图资源加载失败，请刷新重试。</div>' + details; return; } worldMapLabels = labels; if (!worldMapInstance) { $("countryMap").innerHTML = '<div id="worldMap"></div><div class="map-legend"><span><i style="background:rgba(94,234,212,.22)"></i>0.1%+</span><span><i style="background:rgba(94,234,212,.34)"></i>5%+</span><span><i style="background:rgba(94,234,212,.5)"></i>10%+</span><span><i style="background:rgba(94,234,212,.66)"></i>20%+</span><span><i style="background:rgba(94,234,212,.82)"></i>30%+</span><span><i style="background:rgba(94,234,212,1)"></i>50%+</span></div><div id="countryRank"></div>'; worldMapInstance = new jsVectorMap({ selector: "#worldMap", map: "world_merc", backgroundColor: "transparent", zoomButtons: false, zoomOnScroll: false, regionStyle: { initial: { fill: "rgba(219,234,254,.16)", stroke: "rgba(148,163,184,.42)", strokeWidth: 0.65 }, hover: { stroke: "#5eead4", strokeWidth: 1.2 }, selected: { stroke: "#5eead4", strokeWidth: 1.2 } }, onRegionTooltipShow: (event, tooltip, code) => { if (worldMapLabels[code]) tooltip.text(worldMapLabels[code]); } }); attachMapWheelZoom(); $("countryRank").innerHTML = details; worldMapReady = true; setTimeout(() => { if (worldMapInstance) { worldMapInstance.updateSize(); applyCountryColors(values, total); } }, 60); return; } if (worldMapReady && worldMapInstance) { attachMapWheelZoom(); worldMapInstance.updateSize(); applyCountryColors(values, total); if ($("countryRank")) $("countryRank").innerHTML = details; } } catch (error) { $("countryMap").innerHTML = '<div class="muted" style="padding:6px 12px">世界地图渲染失败，请刷新重试。</div>'; } }
-    function render(s, hours, usage, available = true, projectMetrics = null, workerMetrics = null) { currentSummary = s; currentProjectMetrics = projectMetrics; currentWorkerMetrics = workerMetrics; currentAvailable = available; const scope = selectedScopeText(); if (projectMetrics?.matched) $("requestChartSource").value = "worker"; $("requestScopeText").textContent = scope; $("trafficScopeText").textContent = scope; $("workersScopeText").textContent = scope; $("pagesScopeText").textContent = scope; $("totalRequests").textContent = fmt(projectMetrics?.totalRequests ?? s.totalRequests); $("totalBytes").textContent = bytes(s.totalBytes); $("rangeText").textContent = formatRangeText(hours); renderUsage(usage, projectMetrics); $("analysisBlocked").classList.toggle("privacy-hidden", available); $("aiBtn").disabled = !available; $("chartPanel").classList.toggle("blocked", !available); $("trafficChartPanel").classList.toggle("blocked", !available); $("countryPanel").classList.toggle("blocked", !available); $("ipTableWrap").classList.toggle("blocked", !available); $("hostTableWrap").classList.toggle("blocked", !available); $("ipTable").innerHTML = s.topIPs.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientIP) + '</td><td>' + escapeHtml(x.dimensions.clientCountryName||"-") + '</td><td>' + fmt(x.count) + '</td><td>' + percentText(Number(x.count || 0), s.totalRequests) + '</td></tr>').join(""); $("hostTable").innerHTML = s.topHosts.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientRequestHTTPHost) + '</td><td>' + fmt(x.count) + '</td><td>' + percentText(Number(x.count || 0), s.totalRequests) + '</td></tr>').join(""); try { renderCharts(); } catch (error) { $("requestChartNote").textContent = "折线图渲染失败，请刷新重试。"; } renderCountryMap(s.topCountries, s.totalRequests); }
+    function render(s, hours, usage, available = true, projectMetrics = null, workerMetrics = null) { currentSummary = s; currentProjectMetrics = projectMetrics; currentWorkerMetrics = workerMetrics; currentAvailable = available; const scope = selectedScopeText(); if (projectMetrics?.matched) $("requestChartSource").value = "worker"; $("requestScopeText").textContent = scope; $("trafficScopeText").textContent = scope; $("workersScopeText").textContent = scope; $("pagesScopeText").textContent = scope; $("totalRequests").textContent = fmt(projectMetrics?.totalRequests ?? s.totalRequests); $("totalBytes").textContent = bytes(s.totalBytes); $("rangeText").textContent = formatRangeText(hours); $("aiHourLabel").textContent = formatRangeText(hours); renderUsage(usage, projectMetrics); $("analysisBlocked").classList.toggle("privacy-hidden", available); $("aiBtn").disabled = !available; $("chartPanel").classList.toggle("blocked", !available); $("trafficChartPanel").classList.toggle("blocked", !available); $("countryPanel").classList.toggle("blocked", !available); $("ipTableWrap").classList.toggle("blocked", !available); $("hostTableWrap").classList.toggle("blocked", !available); $("ipTable").innerHTML = s.topIPs.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientIP) + '</td><td>' + escapeHtml(x.dimensions.clientCountryName||"-") + '</td><td>' + fmt(x.count) + '</td><td>' + percentText(Number(x.count || 0), s.totalRequests) + '</td></tr>').join(""); $("hostTable").innerHTML = s.topHosts.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientRequestHTTPHost) + '</td><td>' + fmt(x.count) + '</td><td>' + percentText(Number(x.count || 0), s.totalRequests) + '</td></tr>').join(""); try { renderCharts(); } catch (error) { $("requestChartNote").textContent = "折线图渲染失败，请刷新重试。"; } renderCountryMap(s.topCountries, s.totalRequests); }
     function chartOptions(formatter = fmt) { return { responsive:true, maintainAspectRatio:false, plugins:{ legend:{ labels:{ color:"#dbeafe" } }, tooltip:{ callbacks:{ label:(ctx) => ctx.dataset.label + "：" + formatter(ctx.parsed.y) } } }, scales:{ x:{ ticks:{ color:"#8ea3c3", maxTicksLimit:8 }, grid:{ color:"rgba(255,255,255,.06)" } }, y:{ ticks:{ color:"#8ea3c3", callback:(value) => formatter(value) }, grid:{ color:"rgba(255,255,255,.06)" } } } }; }
-    function renderLine(target, series, valueKey, label, color, formatter = fmt, total = null) { const labels = series.map(x => shortBeijingTime(x.time)); const values = series.map(x => Number(x[valueKey] || 0)); return new Chart($(target), { type:"line", data:{ labels, datasets:[{ label, data:values, borderColor:color, backgroundColor:color === "#5eead4" ? "rgba(94,234,212,.16)" : "rgba(96,165,250,.14)", tension:.28, fill:true }] }, options:chartOptions(formatter) }); }
+    function renderLine(target, series, valueKey, label, color, formatter = fmt, total = null) { const labels = series.map(x => shortBeijingTime(x.time)); const values = series.map(x => Number(x[valueKey] || 0)); return new Chart($(target), { type:"line", data:{ labels, datasets:[{ label, data:values, borderColor:color, backgroundColor:color === "#5eead4" ? "rgba(94,234,212,.16)" : "rgba(96,165,250,.14)", tension:.28, fill:true, pointRadius:0, pointHitRadius:10 }] }, options:chartOptions(formatter) }); }
     function seriesTotal(series, key) { return (series || []).reduce((sum, item) => sum + Number(item?.[key] || 0), 0); }
     function renderCharts() { if (chart) chart.destroy(); if (trafficChart) trafficChart.destroy(); $("requestChartNote").textContent = ""; if (!currentAvailable) return; const requestSource = $("requestChartSource").value; if (requestSource === "worker") { const series = currentWorkerMetrics?.timeline || []; const total = currentProjectMetrics?.totalRequests ?? seriesTotal(series, "count"); const projectLabel = currentProjectMetrics ? (currentProjectMetrics.projectName || $("projectInput").value.trim() || "当前服务") + " 项目 请求" : "Worker 请求"; $("requestChartTitle").textContent = "请求数折线：" + projectLabel + "（" + fmt(total) + "）"; if (series.length) chart = renderLine("lineChart", series, "count", projectLabel + "数（北京时间）", "#5eead4", fmt, total); else $("requestChartNote").textContent = "当前账号缺少 Account ID 或暂无 Worker 请求数据。"; } else { const total = Number(currentSummary.totalRequests || seriesTotal(currentSummary.timeline, "count")); $("requestChartTitle").textContent = "请求数折线：HTTP 请求（" + fmt(total) + "）"; if (currentSummary.timeline?.length) chart = renderLine("lineChart", currentSummary.timeline, "count", "HTTP 请求数（北京时间）", "#5eead4", fmt, total); } const trafficTotal = Number(currentSummary.totalBytes || seriesTotal(currentSummary.timeline, "bytes")); $("trafficChartTitle").textContent = "流量折线：HTTP 流量（" + chartBytes(trafficTotal) + "）"; if (currentSummary.timeline?.length) trafficChart = renderLine("trafficChart", currentSummary.timeline, "bytes", "HTTP 流量（北京时间）", "#60a5fa", chartBytes, trafficTotal); setTimeout(() => { if (chart) chart.resize(); if (trafficChart) trafficChart.resize(); }, 60); }
     function resizeVisuals() { if (chart) chart.resize(); if (trafficChart) trafficChart.resize(); if (worldMapInstance) worldMapInstance.updateSize(); }
@@ -1682,7 +1871,7 @@ const INDEX_HTML = `<!doctype html>
     $("zoneSelect").onchange = refresh;
     function openAiConfirm(host) { pendingAiHost = host; const accountText = $("accountSelect").options[$("accountSelect").selectedIndex]?.textContent || ""; const zoneText = $("zoneSelect").options[$("zoneSelect").selectedIndex]?.textContent || "全部区域汇总"; const projectName = $("projectInput").value.trim(); $("aiConfirmAccount").textContent = accountText; $("aiConfirmZone").textContent = zoneText; $("aiConfirmHost").textContent = host; $("aiConfirmProject").textContent = projectName; $("aiConfirmMask").classList.add("open"); }
     function closeAiConfirm() { $("aiConfirmMask").classList.remove("open"); pendingAiHost = ""; }
-    async function runAiAnalysis(host) { const btn = $("aiBtn"); const projectName = $("projectInput").value.trim(); btn.disabled = true; btn.textContent = "分析中..."; $("aiResult").textContent = "正在校验服务名 / 项目名数据..."; try { const q = new URLSearchParams({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours: "24", host, projectName }); const checked = await api("/api/analytics?" + q); render(checked.summary, checked.hours, checked.usage, checked.analyticsAvailable !== false, checked.projectMetrics, checked.workerMetrics); if (!checked.projectMetrics || !checked.projectMetrics.matched) throw new Error("服务名 / 项目名参数错误，无法成功获取该服务的项目级 Workers metrics 数据。"); $("aiResult").textContent = "AI 正在分析指定服务的 24 小时数据..."; const data = await api("/api/ai/analyze", { method:"POST", body: JSON.stringify({ account: $("accountSelect").value, zone: $("zoneSelect").value, host, projectName }) }); $("aiResult").innerHTML = renderMarkdown(data.analysis); } catch (err) { $("aiResult").textContent = err.message; } finally { btn.disabled = false; btn.textContent = "AI 分析 24h"; } }
+    async function runAiAnalysis(host) { const btn = $("aiBtn"); const projectName = $("projectInput").value.trim(); const hours = $("rangeSelect").value; btn.disabled = true; btn.textContent = "分析中..."; $("aiResult").textContent = "正在校验服务名 / 项目名数据..."; try { const q = new URLSearchParams({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours, host, projectName }); const checked = await api("/api/analytics?" + q); render(checked.summary, checked.hours, checked.usage, checked.analyticsAvailable !== false, checked.projectMetrics, checked.workerMetrics); if (!checked.projectMetrics || !checked.projectMetrics.matched) throw new Error("服务名 / 项目名参数错误，无法成功获取该服务的项目级 Workers metrics 数据。"); $("aiResult").textContent = "AI 正在分析指定服务的 " + formatRangeText(Number(hours)) + " 数据..."; const data = await api("/api/ai/analyze", { method:"POST", body: JSON.stringify({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours, host, projectName }) }); $("aiResult").innerHTML = renderMarkdown(data.analysis); } catch (err) { $("aiResult").textContent = err.message; } finally { btn.disabled = false; btn.textContent = "AI 分析 " + formatRangeText(Number(hours)); } }
     $("aiBtn").onclick = () => { const host = $("hostInput").value.trim(); const projectName = $("projectInput").value.trim(); if (!session.aiAvailable) { $("aiResult").textContent = "当前 Pages 项目未绑定 Workers AI，请根据仓库 README 在 Functions 设置中添加 AI 绑定后重新部署。"; return; } if (!accountCache.length) { $("aiResult").textContent = NO_ACCOUNT_MESSAGE; return; } if ($("accountSelect").value === "all") { $("aiResult").textContent = "请先选择一个具体账号，再进行 AI 盗用风险分析。"; return; } if (!host) { $("aiResult").textContent = "请先输入主机名，再基于筛选后的数据进行 AI 盗用风险分析。"; return; } if (!projectName) { $("aiResult").textContent = "AI 分析必须输入服务名 / 项目名参数。"; return; } openAiConfirm(host); };
     $("aiConfirmNo").onclick = closeAiConfirm;
     $("aiConfirmMask").onclick = (event) => { if (event.target === $("aiConfirmMask")) closeAiConfirm(); };
@@ -1712,8 +1901,9 @@ const ADMIN_PANEL_HTML = `<!doctype html>
     p, label, small { color:var(--muted); }
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:22px; padding:20px; overflow:hidden; }
     .grid { display:grid; gap:12px; }
-    input, textarea, button { font:inherit; border-radius:13px; }
-    input, textarea { width:100%; border:1px solid var(--line); background:#0d172b; color:var(--text); padding:11px; }
+    input, textarea, select, button { font:inherit; border-radius:13px; }
+    input, textarea, select { width:100%; border:1px solid var(--line); background:#0d172b; color:var(--text); padding:11px; }
+    select { appearance:auto; cursor:pointer; }
     textarea { min-height:120px; resize:vertical; }
     input[type=checkbox] { width:18px; height:18px; min-width:18px; margin:0; accent-color:var(--accent); }
     button { min-width:256px; border:0; background:var(--accent); color:#07101d; font-weight:800; padding:11px 14px; cursor:pointer; }
@@ -1764,6 +1954,14 @@ const ADMIN_PANEL_HTML = `<!doctype html>
       <label class="check"><input id="aiVerboseData" type="checkbox"> AI 结果允许引用详细数据</label>
       <div class="row"><button id="savePrivacyBtn" type="button">保存隐私设置</button></div>
       <div id="privacyMsg" class="msg"></div>
+    </section>
+    <section class="panel grid">
+      <h2>自动采集</h2>
+      <p>定时通过 Cloudflare API 拉取近 24h 数据并存入 KV，逐步积累 3 天/7 天历史数据。</p>
+      <label>采集间隔<select id="cronInterval"><option value="0">关闭</option><option value="1">每 1 小时</option><option value="6">每 6 小时</option><option value="24">每日一次</option></select></label>
+      <small>上次采集：<span id="cronLastRun">-</span></small>
+      <div class="row"><button id="triggerCronBtn" class="secondary" type="button">立即执行</button><button id="saveCronBtn" type="button">保存设置</button></div>
+      <div id="cronMsg" class="msg"></div>
     </section>
   </main>
   <div id="deleteConfirmMask" class="modal-mask">
@@ -2011,7 +2209,41 @@ const ADMIN_PANEL_HTML = `<!doctype html>
         msg.textContent = error.message;
       }
     });
-    Promise.all([loadAccounts(), loadPrivacy()]).catch((error) => {
+    async function loadCronConfig() {
+      try {
+        const data = await api("/api/cron-config");
+        const cfg = data.config || {};
+        $("cronInterval").value = String(cfg.interval || 0);
+        $("cronLastRun").textContent = cfg.lastRun ? new Date(cfg.lastRun).toLocaleString("zh-CN", { hour12: false }) : "从未采集";
+      } catch {}
+    }
+    $("saveCronBtn").addEventListener("click", async () => {
+      const msg = $("cronMsg");
+      msg.classList.remove("error");
+      msg.textContent = "保存中...";
+      try {
+        const data = await api("/api/cron-config", { method: "PUT", body: JSON.stringify({ interval: Number($("cronInterval").value) }) });
+        msg.textContent = "已保存";
+        $("cronLastRun").textContent = data.config.lastRun ? new Date(data.config.lastRun).toLocaleString("zh-CN", { hour12: false }) : "从未采集";
+      } catch (error) {
+        msg.classList.add("error");
+        msg.textContent = error.message;
+      }
+    });
+    $("triggerCronBtn").addEventListener("click", async () => {
+      const msg = $("cronMsg");
+      msg.classList.remove("error");
+      msg.textContent = "正在触发采集...";
+      try {
+        await api("/api/cron-config", { method: "POST" });
+        msg.textContent = "已触发，数据采集需等待约 30 秒完成。";
+        setTimeout(() => loadCronConfig(), 2000);
+      } catch (error) {
+        msg.classList.add("error");
+        msg.textContent = error.message;
+      }
+    });
+    Promise.all([loadAccounts(), loadPrivacy(), loadCronConfig()]).catch((error) => {
       $("accounts").textContent = error.message;
       $("accounts").classList.add("error");
     });
